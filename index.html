@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="ja" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ヒマリスト</title>
+    <link rel="stylesheet" href="/freetime/output.css">
+    <link rel="icon" href="/freetime/favicon.ico" type="image/x-icon">
+    <script src="https://apis.google.com/js/api.js"></script>
+    <script src="https://unpkg.com/react@17/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@17/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <style>
+        :root {
+            color-scheme: dark;
+        }
+        body {
+            background-color: #1F2226;
+            color: #D1D5DB;
+        }
+        .notion-dark {
+            --bg-primary: #1F2226;
+            --text-primary: #D1D5DB;
+            --accent-color: #4B5EAA;
+        }
+    </style>
+</head>
+<body style="overflow-x: hidden;">
+    <div id="root"></div>
+    <script type="text/babel" src="/freetime/app.js"></script>
+</body>
+</html>
