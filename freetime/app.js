@@ -237,7 +237,7 @@ function App() {
       setError('Google APIライブラリが読み込まれていません');
       return;
     }
-    const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?` + `client_id=${encodeURIComponent(CLIENT_ID)}&` + `redirect_uri=${encodeURIComponent('https://sumalab.online/freetime/')}&` + `response_type=token&` + `scope=${encodeURIComponent(SCOPES)}&` + `prompt=consent`;
+    const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?` + `client_id=${encodeURIComponent(CLIENT_ID)}&` + `redirect_uri=${encodeURIComponent('https://jwelim.github.io/freetime/')}&` + `response_type=token&` + `scope=${encodeURIComponent(SCOPES)}&` + `prompt=consent`;
     window.location.href = authUrl;
   };
   const handleSignOut = () => {
