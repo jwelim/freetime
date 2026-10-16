@@ -11,6 +11,8 @@ const SCOPES = 'https://www.googleapis.com/auth/calendar.readonly';
 const API = 'https://www.googleapis.com/calendar/v3';
 const MAX_DAYS = 40;
 const DEFAULT_HEADER = '以下の日程でご都合いかがでしょうか。';
+const DEFAULT_BUSY_HEADER = '以下の時間は予定が入っています。';
+const DEFAULT_AI_REQUEST = '上記の埋まっている時間を避けて、次の条件で空き時間の候補を作ってください。\n- （ここに条件を書く）';
 const IS_DEMO = new URLSearchParams(location.search).has('demo');
 
 // ---------- 保存（localStorage が使えない環境でも落ちないようにする） ----------
@@ -94,24 +96,65 @@ async function callApi(path, { method = 'GET', body } = {}, retry = true) {
   return data;
 }
 
+// 予定モード用：予定名つきで取得する（freeBusy は予定名を返さないため events.list を使う）
+// キャンセル済み・「予定なし」の時間指定予定・辞退した予定・勤務場所／誕生日は除く。
+// 終日予定は既定で「予定なし」扱いのことが多いため、透過でも残し、画面の「終日予定を除く」で切り替える。
+async function fetchEvents(calendarIds, timeMin, timeMax) {
+  const out = [];
+  for (const id of calendarIds) {
+    let pageToken = '';
+    do {
+      const q = new URLSearchParams({
+        timeMin: timeMin.toISOString(), timeMax: timeMax.toISOString(),
+        singleEvents: 'true', orderBy: 'startTime', maxResults: '2500',
+        fields: 'nextPageToken,items(summary,start,end,status,transparency,eventType,attendees(self,responseStatus))',
+      });
+      if (pageToken) q.set('pageToken', pageToken);
+      const data = await callApi(`/calendars/${encodeURIComponent(id)}/events?${q}`);
+      for (const e of data.items || []) {
+        const allDay = !!e.start?.date;
+        if (e.status === 'cancelled') continue;
+        if (e.eventType === 'workingLocation' || e.eventType === 'birthday') continue;
+        if (!allDay && e.transparency === 'transparent') continue;
+        if (e.attendees?.some(a => a.self && a.responseStatus === 'declined')) continue;
+        const start = allDay ? C.parseLocal(e.start.date) : new Date(e.start?.dateTime);
+        const end = allDay ? C.parseLocal(e.end.date) : new Date(e.end?.dateTime);
+        if (isNaN(start) || isNaN(end)) continue;
+        out.push({ start, end, allDay, summary: e.summary || '', calendarId: id });
+      }
+      pageToken = data.nextPageToken;
+    } while (pageToken);
+  }
+  return out;
+}
+
 // ---------- デモ用データ（?demo を付けて開くとログインなしで試せる） ----------
 const demo = {
   calendars: [
     { id: 'demo-main', summary: 'デモ用カレンダー', backgroundColor: '#6d9eeb', primary: true },
     { id: 'demo-work', summary: '仕事（デモ）', backgroundColor: '#e06666' },
   ],
-  busy(startDate, endDate) {
+  // 予定名・カレンダー・終日予定つきの架空の予定
+  events(startDate, endDate) {
     const out = [];
     const days = C.listDays(startDate, endDate, [0, 1, 2, 3, 4, 5, 6]);
     days.forEach((d, i) => {
-      const at = (t1, t2) => out.push({ start: C.parseLocal(d, t1), end: C.parseLocal(d, t2) });
-      if (i % 3 === 0) at('10:00', '11:30');
-      if (i % 2 === 1) at('13:00', '14:15');
-      if (i % 4 === 2) at('09:00', '12:00');
-      if (i % 5 === 4) at('15:30', '17:00');
-      at('12:00', '12:45');
+      const at = (cal, t1, t2, summary) => out.push({
+        start: C.parseLocal(d, t1), end: C.parseLocal(d, t2), allDay: false, summary, calendarId: cal,
+      });
+      if (i % 3 === 0) at('demo-work', '10:00', '11:30', '定例会議');
+      if (i % 2 === 1) at('demo-work', '13:00', '14:15', '打ち合わせ');
+      if (i % 4 === 2) at('demo-main', '09:00', '12:00', '通院');
+      if (i % 5 === 4) at('demo-work', '15:30', '17:00', '顧客訪問');
+      if (i % 3 === 1) at('demo-work', '16:30', '16:45', '電話');
+      at('demo-main', '12:00', '12:45', 'ランチ');
+      if (i === 5) out.push({ start: C.parseLocal(d), end: C.parseLocal(C.addDays(d, 1)), allDay: true, summary: '有給休暇', calendarId: 'demo-main' });
     });
     return out;
+  },
+  // 空き時間モード用（freeBusy と同じく終日予定は含めない）
+  busy(startDate, endDate) {
+    return this.events(startDate, endDate).filter(e => !e.allDay).map(({ start, end }) => ({ start, end }));
   },
 };
 
@@ -155,6 +198,22 @@ function App() {
   const [hoursByDay, setHoursByDay] = usePersistent('hoursByDay', {}); // {曜日番号: {start,end}}
   const [maxPerDay, setMaxPerDay] = usePersistent('maxPerDay', 0); // 0 = 制限なし
   const [pickBy, setPickBy] = usePersistent('pickBy', 'spread');
+  const [maxTotal, setMaxTotal] = usePersistent('maxTotal', 0); // 全体の候補数（0 = 制限なし）
+  const [cluster, setCluster] = usePersistent('cluster', false); // 予定に寄せる（固める）
+  const [preferAdjacent, setPreferAdjacent] = usePersistent('preferAdjacent', true);
+  const [preferBusyDays, setPreferBusyDays] = usePersistent('preferBusyDays', true);
+  // 予定（埋まっている時間）モード
+  const [mode, setMode] = usePersistent('mode', 'free'); // 'free' | 'busy'
+  const [busyFormat, setBusyFormat] = usePersistent('busyFormat', 'ai'); // 'ai' | 'plain'
+  const [showTitles, setShowTitles] = usePersistent('showTitles', false);
+  const [byCalendar, setByCalendar] = usePersistent('byCalendar', false);
+  const [busyMinLength, setBusyMinLength] = usePersistent('busyMinLength', 0);
+  const [excludeAllDay, setExcludeAllDay] = usePersistent('excludeAllDay', false);
+  const [includeKw, setIncludeKw] = usePersistent('includeKw', '');
+  const [excludeKw, setExcludeKw] = usePersistent('excludeKw', '');
+  const [busyHeader, setBusyHeader] = usePersistent('busyHeader', DEFAULT_BUSY_HEADER);
+  const [aiRequest, setAiRequest] = usePersistent('aiRequest', DEFAULT_AI_REQUEST);
+  const [rawEvents, setRawEvents] = useState(null); // 予定モードで取得した予定（絞り込み前）
   const [busy, setBusy] = useState([]);
   const [freeTimes, setFreeTimes] = useState(null); // null = 未実行
   const [searched, setSearched] = useState(null); // 抽出時の条件（タイムライン表示用）
@@ -294,6 +353,23 @@ function App() {
     try {
       const timeMin = C.parseLocal(startDate, '00:00');
       const timeMax = C.parseLocal(C.addDays(endDate, 1), '00:00');
+      if (mode === 'busy') {
+        let events;
+        if (IS_DEMO) {
+          await new Promise(r => setTimeout(r, 400));
+          events = demo.events(startDate, endDate).filter(e => selectedCalendars.includes(e.calendarId));
+        } else {
+          events = await fetchEvents(selectedCalendars, timeMin, timeMax);
+        }
+        setRawEvents(events);
+        setFreeTimes(null);
+        setSearched({
+          mode: 'busy', startDate, endDate, startTime, endTime, hoursByDay: effectiveHours(), breaks,
+          includedDays, minDuration, bufferMin, calendarIds: [...selectedCalendars], now: new Date(),
+        });
+        setTimeout(() => resultRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50);
+        return;
+      }
       let busyList;
       if (IS_DEMO) {
         await new Promise(r => setTimeout(r, 400));
@@ -323,15 +399,16 @@ function App() {
       }
       const opts = {
         startDate, endDate, startTime, endTime, hoursByDay: effectiveHours(), breaks,
-        includedDays, minDuration, bufferMin, now: new Date(),
+        includedDays, minDuration, bufferMin, now: new Date(), mode: 'free',
       };
+      setRawEvents(null);
       setBusy(C.mergeIntervals(busyList));
       setFreeTimes(C.computeFreeIntervals(busyList, opts));
       setSearched(opts);
       setTimeout(() => resultRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50);
     } catch (e) {
-      console.error('ヒマ時間取得エラー:', e);
-      setError('ヒマ時間の取得に失敗しました: ' + e.message);
+      console.error('取得エラー:', e);
+      setError((mode === 'busy' ? '予定' : 'ヒマ時間') + 'の取得に失敗しました: ' + e.message);
     } finally {
       setLoading(false);
     }
@@ -339,13 +416,50 @@ function App() {
 
   // 出力に使う最小時間は抽出したときの値（抽出後に設定を変えても結果とずれないように）
   const outMin = searched ? searched.minDuration : minDuration;
-  const outputText = useMemo(
-    () => freeTimes ? C.formatFreeTimes(freeTimes, { format: outputFormat, minDuration: outMin, maxPerDay, pickBy, header }) : '',
-    [freeTimes, outputFormat, outMin, maxPerDay, pickBy, header]);
+  const candOpts = { format: outputFormat, minDuration: outMin, maxPerDay, pickBy, maxTotal, cluster, preferAdjacent, preferBusyDays };
+  const candKey = JSON.stringify(candOpts);
   // タイムラインで「リストに載せた時間」を塗るための候補一覧
   const listed = useMemo(
-    () => freeTimes ? [...C.listCandidates(freeTimes, { format: outputFormat, minDuration: outMin, maxPerDay, pickBy }).values()].flat() : [],
-    [freeTimes, outputFormat, outMin, maxPerDay, pickBy]);
+    () => freeTimes ? [...C.listCandidates(freeTimes, candOpts).values()].flat() : [],
+    [freeTimes, candKey]);
+
+  // 予定モード：絞り込みはその場で反映する（取得し直さない）
+  const busyFilter = { minLength: busyMinLength, excludeAllDay, include: includeKw, exclude: excludeKw };
+  const busyByDay = useMemo(
+    () => rawEvents && searched?.mode === 'busy' ? C.filterEvents(rawEvents, { ...searched, ...busyFilter }) : null,
+    [rawEvents, searched, JSON.stringify(busyFilter)]);
+  // タイムライン用：絞り込み後の予定（終日予定はその日まるごと）
+  const busyShown = useMemo(() => {
+    if (!busyByDay) return busy;
+    const list = [];
+    for (const [day, evs] of busyByDay) {
+      for (const e of evs) list.push(e.allDay ? { start: C.parseLocal(day), end: C.parseLocal(C.addDays(day, 1)) } : e);
+    }
+    return C.mergeIntervals(list);
+  }, [busyByDay, busy]);
+
+  const filterNote = () => {
+    const n = [];
+    if (busyMinLength) n.push(`${busyMinLength}分未満の予定を除外`);
+    if (excludeAllDay) n.push('終日予定を除外');
+    if (includeKw.trim()) n.push(`予定名に「${includeKw.trim().split(/[\s　]+/).join('」「')}」のいずれかを含むものだけ`);
+    if (excludeKw.trim()) n.push(`予定名に「${excludeKw.trim().split(/[\s　]+/).join('」「')}」を含むものを除外`);
+    return n.join('、');
+  };
+
+  const outputText = useMemo(() => {
+    if (busyByDay) {
+      const cals = byCalendar
+        ? calendars.filter(c => searched.calendarIds.includes(c.id)).map(c => ({ id: c.id, name: c.summaryOverride || c.summary }))
+        : null;
+      return C.formatBusy(busyByDay, {
+        format: busyFormat, showTitles, calendars: cals, header: busyHeader, request: aiRequest,
+        emptyLabel: filterNote() ? '該当する予定なし' : '予定なし',
+        context: { ...searched, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, filterNote: filterNote() },
+      });
+    }
+    return freeTimes ? C.formatFreeTimes(freeTimes, { ...candOpts, header }) : '';
+  }, [freeTimes, candKey, header, busyByDay, busyFormat, showTitles, byCalendar, busyHeader, aiRequest, calendars]);
 
   const copyToClipboard = async () => {
     try {
@@ -369,7 +483,16 @@ function App() {
       h('button', { className: 'btn primary block', onClick: () => { setIsMenuOpen(false); setIsUsageOpen(true); } }, '使い方'),
       isSignedIn && h('button', { className: 'btn ghost block', onClick: handleSignOut }, IS_DEMO ? 'デモを終了' : 'ログアウト')));
 
+  const modeSwitch = h('div', { className: 'segmented', role: 'tablist', 'aria-label': '抽出するもの' },
+    [['free', '空き時間'], ['busy', '予定（埋まっている時間）']].map(([k, l]) => h('button', {
+      key: k, type: 'button', role: 'tab', 'aria-selected': mode === k,
+      className: mode === k ? 'on' : '', onClick: () => setMode(k),
+    }, l)));
+
   const settings = h('section', { className: 'card' },
+    modeSwitch,
+    mode === 'busy' && h('p', { className: 'muted small note' },
+      '埋まっている時間を書き出します。ChatGPT などの AI に貼って、細かい条件で空き時間を作ってもらう用途向けです。'),
     h('div', { className: 'presets' },
       h('span', { className: 'field-label' }, '期間'),
       [['thisWeek', '今週'], ['nextWeek', '来週'], ['13', '2週間'], ['29', '1か月']].map(([k, l]) =>
@@ -406,10 +529,12 @@ function App() {
           !breaks.some(b => b.start === '12:00' && b.end === '13:00') &&
             h('button', { type: 'button', className: 'chip', onClick: () => addBreak('12:00', '13:00') }, '昼休み 12:00〜13:00 を追加'),
           h('button', { type: 'button', className: 'chip', onClick: () => addBreak('15:00', '15:30') }, '時間帯を追加'))),
-      h(Field, { label: '最小ヒマ時間', hint: 'これより短い空きは出さない' },
+      h(Field, mode === 'busy'
+        ? { label: '1件あたりの所要時間', hint: 'AI向けの前提に入れる' }
+        : { label: '最小ヒマ時間', hint: 'これより短い空きは出さない' },
         h('select', { value: minDuration, onChange: e => setMinDuration(Number(e.target.value)) },
           [30, 45, 60, 90, 120, 150, 180].map(v => h('option', { key: v, value: v }, `${v}分`)))),
-      h(Field, { label: '予定の前後の余裕', hint: '移動や準備の時間' },
+      h(Field, { label: '予定の前後の余裕', hint: mode === 'busy' ? 'AI向けの前提に入れる' : '移動や準備の時間' },
         h('select', { value: bufferMin, onChange: e => setBufferMin(Number(e.target.value)) },
           [0, 10, 15, 30, 60].map(v => h('option', { key: v, value: v }, v ? `${v}分` : 'なし')))),
       h(Field, { label: 'カレンダー', hint: '予定を確認するカレンダー', wide: true },
@@ -420,7 +545,40 @@ function App() {
             h('span', { className: 'dot', style: { background: c.backgroundColor || '#888' } }),
             h('span', { className: 'cal-name' }, c.summaryOverride || c.summary, c.primary && h('span', { className: 'muted' }, '（メイン）'))))))));
 
-  const result = freeTimes && h('section', { className: 'card fade-in', ref: resultRef },
+  const busyResult = busyByDay && mode === 'busy' && h('section', { className: 'card fade-in', ref: resultRef },
+    h('h2', null, '埋まっている時間'),
+    h('div', { className: 'grid' },
+      h(Field, { label: '出力形式' },
+        h('select', { value: busyFormat, onChange: e => setBusyFormat(e.target.value) },
+          h('option', { value: 'ai' }, 'AI向け（前提・依頼文つき）'),
+          h('option', { value: 'plain' }, 'シンプル（日ごとの一覧）'))),
+      h(Field, { label: '予定の長さ', hint: 'これより短い予定を除く' },
+        h('select', { value: busyMinLength, onChange: e => setBusyMinLength(Number(e.target.value)) },
+          [0, 15, 30, 60, 90, 120].map(v => h('option', { key: v, value: v }, v ? `${v}分以上` : 'すべて')))),
+      h(Field, { label: '予定名に含む', hint: 'スペース区切りでいずれか' },
+        h('input', { type: 'text', value: includeKw, placeholder: '例：会議 打ち合わせ', onChange: e => setIncludeKw(e.target.value) })),
+      h(Field, { label: '予定名から除く', hint: 'スペース区切り' },
+        h('input', { type: 'text', value: excludeKw, placeholder: '例：ランチ', onChange: e => setExcludeKw(e.target.value) })),
+      h('div', { className: 'field wide switches' },
+        [[excludeAllDay, setExcludeAllDay, '終日予定を除く'],
+          [showTitles, setShowTitles, '予定名を含める'],
+          [byCalendar, setByCalendar, 'カレンダー別に分ける']].map(([v, set, l]) =>
+          h('label', { key: l, className: 'switch' },
+            h('input', { type: 'checkbox', checked: v, onChange: e => set(e.target.checked) }), h('span', null, l)))),
+      showTitles && h('p', { className: 'field wide warn small' }, '予定名が文章に入ります。AI や相手に渡してよい内容か確認してから使ってください。'),
+      busyFormat === 'ai'
+        ? h(Field, { label: '依頼文', hint: 'AI に頼む条件を書き足す', wide: true },
+          h('textarea', { rows: 3, value: aiRequest, placeholder: DEFAULT_AI_REQUEST, onChange: e => setAiRequest(e.target.value) }))
+        : h(Field, { label: '前置き文', hint: '空欄で省略', wide: true },
+          h('input', { type: 'text', value: busyHeader, placeholder: DEFAULT_BUSY_HEADER, onChange: e => setBusyHeader(e.target.value) }))),
+    h('pre', { className: 'output' }, outputText),
+    h('div', { className: 'actions' },
+      h('button', { className: 'btn primary', onClick: copyToClipboard }, h(Icon, { d: ICONS.copy }), 'コピー'),
+      navigator.share && h('button', { className: 'btn ghost', onClick: shareText }, h(Icon, { d: ICONS.share }), '共有')),
+    h('h2', { className: 'mt' }, 'スケジュール'),
+    h(Timeline, { searched, busy: busyShown, freeTimes: [], listed: [], busyMode: true }));
+
+  const result = freeTimes && mode === 'free' && h('section', { className: 'card fade-in', ref: resultRef },
     h('h2', null, 'ヒマ時間'),
     freeTimes.length === 0
       ? h('p', { className: 'empty' }, '条件に合うヒマ時間が見つかりませんでした。期間を広げるか、最小ヒマ時間を短くしてみてください。')
@@ -433,7 +591,22 @@ function App() {
           h(Field, { label: '1日の候補数', hint: outputFormat === 'slots' ? '開始時刻の数' : '時間帯の数' },
             h('select', { value: maxPerDay, onChange: e => setMaxPerDay(Number(e.target.value)) },
               [0, 1, 2, 3, 4, 5].map(v => h('option', { key: v, value: v }, v ? `${v}件まで` : '制限なし')))),
-          maxPerDay > 0 && h(Field, { label: '絞り方' },
+          h(Field, { label: '全体の候補数', hint: cluster ? '優先順に数える' : '早い順に数える' },
+            h('select', { value: maxTotal, onChange: e => setMaxTotal(Number(e.target.value)) },
+              [0, 3, 5, 8, 10, 15].map(v => h('option', { key: v, value: v }, v ? `${v}件まで` : '制限なし')))),
+          h('div', { className: 'field wide cluster-box' },
+            h('label', { className: 'switch' },
+              h('input', { type: 'checkbox', checked: cluster, onChange: e => setCluster(e.target.checked) }),
+              h('span', { className: 'field-label' }, '予定に寄せる（固める）')),
+            cluster && h('div', { className: 'stack sub' },
+              h('label', { className: 'switch' },
+                h('input', { type: 'checkbox', checked: preferAdjacent, onChange: e => setPreferAdjacent(e.target.checked) }),
+                h('span', null, `予定の直前・直後を優先（候補は予定にくっつけた${outMin}分の枠になります）`)),
+              h('label', { className: 'switch' },
+                h('input', { type: 'checkbox', checked: preferBusyDays, onChange: e => setPreferBusyDays(e.target.checked) }),
+                h('span', null, '予定がある日を優先（予定のない日を丸ごと空けておく）')),
+              h('p', { className: 'muted small' }, '候補数を絞ると、予定の間の隙間 → 予定の前後 → その他の順に選びます。'))),
+          !cluster && maxPerDay > 0 && h(Field, { label: '絞り方' },
             h('select', { value: pickBy, onChange: e => setPickBy(e.target.value) },
               h('option', { value: 'spread' }, '1日の中でばらけさせる'),
               h('option', { value: 'early' }, '早い時間を優先'),
@@ -459,13 +632,14 @@ function App() {
     !isSignedIn
       ? h('div', { className: 'signin' },
         h('button', { className: 'btn primary', onClick: handleSignIn }, 'Googleでログイン'),
-        h('p', { className: 'muted small' }, 'カレンダーは読み取りのみ。予定の内容は表示・送信しません。'),
+        h('p', { className: 'muted small' }, 'カレンダーは読み取りのみ。予定名は「予定」モードで絞り込み・表示するときだけ読み込み、外部へは送りません。'),
         h('a', { className: 'link small', href: '?demo' }, 'ログインせずにデモで試す'))
       : h(React.Fragment, null,
         settings,
         h('button', { className: 'btn primary cta', onClick: fetchFreeTimes, disabled: loading },
-          loading ? '読み込み中...' : 'ヒマ時間を抽出'),
-        result),
+          loading ? '読み込み中...' : (mode === 'busy' ? '予定を抽出' : 'ヒマ時間を抽出')),
+        result,
+        busyResult),
     isUsageOpen && h(UsageModal, { guide: usageGuide, onClose: () => setIsUsageOpen(false) }),
     h(Toast, { message: toast }));
 }
@@ -479,7 +653,7 @@ function TimeRange({ start, end, onStart, onEnd }) {
 }
 
 // 30分刻みのタイムライン
-function Timeline({ searched, busy, freeTimes, listed }) {
+function Timeline({ searched, busy, freeTimes, listed, busyMode = false }) {
   if (!searched) return null;
   const days = C.listDays(searched.startDate, searched.endDate, searched.includedDays);
   const windows = Object.fromEntries(days.map(d => [d, C.dayWindow(searched, C.parseLocal(d).getDay())]));
@@ -521,8 +695,10 @@ function Timeline({ searched, busy, freeTimes, listed }) {
           }));
       }))),
     h('div', { className: 'legend' },
-      [['free', 'リストに掲載'], ['unlisted', '空き（候補から外した）'], ['short', '短い空き・余裕時間'],
-        ['busy', '予定あり'], ['off', '対象外の時間'], ['past', '過去']].map(([c, l]) =>
+      (busyMode
+        ? [['busy', '予定あり（絞り込み後）'], ['short', '空き'], ['off', '対象外の時間'], ['past', '過去']]
+        : [['free', 'リストに掲載'], ['unlisted', '空き（候補から外した）'], ['short', '短い空き・余裕時間'],
+          ['busy', '予定あり'], ['off', '対象外の時間'], ['past', '過去']]).map(([c, l]) =>
         h('span', { key: c }, h('i', { className: c }), l))));
 }
 

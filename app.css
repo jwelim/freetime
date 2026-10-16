@@ -26,7 +26,7 @@ body {
   line-height: 1.6;
   -webkit-text-size-adjust: 100%;
 }
-button, input, select { font: inherit; color: inherit; }
+button, input, select, textarea { font: inherit; color: inherit; }
 h1, h2, h3, p { margin: 0; }
 
 .app { max-width: 720px; margin: 0 auto; padding: 24px 16px 64px; }
@@ -58,9 +58,20 @@ h1, h2, h3, p { margin: 0; }
 .chip:hover { border-color: var(--accent); }
 .presets.tight { margin: 6px 0 0; }
 
+.segmented { display: flex; gap: 4px; padding: 4px; margin-bottom: 14px; border-radius: 10px; background: var(--field); }
+.segmented button { flex: 1; padding: 8px 10px; border: 0; border-radius: 8px; background: transparent; cursor: pointer; font-size: .9rem; }
+.segmented button.on { background: linear-gradient(to right, var(--accent), var(--accent2)); color: #fff; }
+.note { margin: -6px 0 12px; }
+.cluster-box { padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; }
+.stack.sub { margin: 8px 0 0 24px; }
+.switches { flex-direction: row; flex-wrap: wrap; gap: 8px 18px; }
+.warn { color: #fcd34d; margin: 0; }
+.field textarea { width: 100%; padding: 8px 10px; border-radius: 8px; background: var(--field); border: 1px solid var(--line); resize: vertical; font: inherit; color: inherit; }
+.field textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+
 .row-between { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
 .switch { display: inline-flex; align-items: center; gap: 6px; font-size: .85rem; cursor: pointer; }
-.switch input { width: 16px; height: 16px; padding: 0; accent-color: var(--accent); }
+.switch input { width: 16px; height: 16px; padding: 0; flex: none; accent-color: var(--accent); }
 .stack { display: flex; flex-direction: column; gap: 6px; }
 .time-range { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .field .time-range input, .time-range input { flex: 0 1 140px; width: auto; min-width: 108px; padding: 8px 10px; border-radius: 8px; background: var(--field); border: 1px solid var(--line); }
