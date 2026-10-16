@@ -42,7 +42,7 @@ h1, h2, h3, p { margin: 0; }
 .card h2.mt { margin-top: 24px; }
 
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-@media (max-width: 480px) { .grid { grid-template-columns: 1fr; } }
+@media (max-width: 480px) { .grid { grid-template-columns: 1fr; } .card { padding: 16px; } }
 .field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .field.wide { grid-column: 1 / -1; }
 .field-label { font-size: .9rem; font-weight: 600; }
@@ -56,6 +56,18 @@ h1, h2, h3, p { margin: 0; }
 .presets { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 14px; }
 .chip { padding: 4px 12px; border-radius: 999px; border: 1px solid var(--line); background: transparent; cursor: pointer; font-size: .85rem; }
 .chip:hover { border-color: var(--accent); }
+.presets.tight { margin: 6px 0 0; }
+
+.row-between { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.switch { display: inline-flex; align-items: center; gap: 6px; font-size: .85rem; cursor: pointer; }
+.switch input { width: 16px; height: 16px; padding: 0; accent-color: var(--accent); }
+.stack { display: flex; flex-direction: column; gap: 6px; }
+.time-range { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.field .time-range input, .time-range input { flex: 0 1 140px; width: auto; min-width: 108px; padding: 8px 10px; border-radius: 8px; background: var(--field); border: 1px solid var(--line); }
+.day-hours { display: flex; align-items: center; gap: 10px; }
+.day-name { width: 1.5em; text-align: center; font-weight: 600; flex: none; }
+.day-name.sun { color: var(--sun); }
+.day-name.sat { color: var(--accent); }
 
 .days { display: flex; flex-wrap: wrap; gap: 8px; }
 .day {
@@ -130,6 +142,8 @@ td.free, .legend i.free { background: var(--free); }
 td.busy, .legend i.busy { background: var(--busy); }
 td.short, .legend i.short { background: var(--short); }
 td.past, .legend i.past { background: var(--past); }
+td.unlisted, .legend i.unlisted { background: repeating-linear-gradient(45deg, var(--free) 0 3px, var(--short) 3px 6px); }
+td.off, .legend i.off { background: repeating-linear-gradient(135deg, #34373c 0 2px, var(--bg) 2px 6px); }
 .legend { display: flex; flex-wrap: wrap; justify-content: center; gap: 14px; margin-top: 10px; font-size: .8rem; color: var(--muted); }
 .legend span { display: inline-flex; align-items: center; gap: 6px; }
 .legend i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; }

@@ -150,6 +150,11 @@ function App() {
   const [includedDays, setIncludedDays] = usePersistent('days', [1, 2, 3, 4, 5]);
   const [outputFormat, setOutputFormat] = usePersistent('format', 'range');
   const [header, setHeader] = usePersistent('header', DEFAULT_HEADER);
+  const [breaks, setBreaks] = usePersistent('breaks', []); // [{start,end}] 毎日除外する時間帯
+  const [perDayOn, setPerDayOn] = usePersistent('perDayOn', false);
+  const [hoursByDay, setHoursByDay] = usePersistent('hoursByDay', {}); // {曜日番号: {start,end}}
+  const [maxPerDay, setMaxPerDay] = usePersistent('maxPerDay', 0); // 0 = 制限なし
+  const [pickBy, setPickBy] = usePersistent('pickBy', 'spread');
   const [busy, setBusy] = useState([]);
   const [freeTimes, setFreeTimes] = useState(null); // null = 未実行
   const [searched, setSearched] = useState(null); // 抽出時の条件（タイムライン表示用）
@@ -234,6 +239,17 @@ function App() {
     setIncludedDays(prev => prev.includes(day) ? prev.filter(d => d !== day) : [...prev, day].sort((a, b) => a - b));
   };
 
+  // 曜日ごとの時間帯。未設定の曜日は共通の時間帯を使う
+  const hoursOf = dow => hoursByDay[dow] || { start: startTime, end: endTime };
+  const setDayHours = (dow, key, value) => setHoursByDay(prev => ({ ...prev, [dow]: { ...hoursOf(dow), [key]: value } }));
+  const effectiveHours = () => perDayOn
+    ? Object.fromEntries(includedDays.map(d => [d, hoursOf(d)]))
+    : null;
+
+  const updateBreak = (i, key, value) => setBreaks(prev => prev.map((b, j) => j === i ? { ...b, [key]: value } : b));
+  const removeBreak = i => setBreaks(prev => prev.filter((_, j) => j !== i));
+  const addBreak = (start = '12:00', end = '13:00') => setBreaks(prev => [...prev, { start, end }]);
+
   const toggleCalendar = id => {
     setSelectedCalendars(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
   };
@@ -260,7 +276,11 @@ function App() {
     if (endDate < startDate) return '終了日は開始日以降にしてください';
     if (C.listDays(startDate, endDate, [0, 1, 2, 3, 4, 5, 6]).length > MAX_DAYS + 1) return `期間は${MAX_DAYS}日以内にしてください`;
     if (endDate < today) return '期間がすべて過去になっています';
-    if (endTime <= startTime) return '終了時間は開始時間より後にしてください';
+    if (perDayOn) {
+      const bad = includedDays.find(d => hoursOf(d).end <= hoursOf(d).start);
+      if (bad != null) return `${C.WEEKDAYS[bad]}曜日の終了時間は開始時間より後にしてください`;
+    } else if (endTime <= startTime) return '終了時間は開始時間より後にしてください';
+    if (breaks.some(b => !b.start || !b.end || b.end <= b.start)) return '除外する時間帯は、終わりを始まりより後にしてください';
     if (selectedCalendars.length === 0) return '少なくとも1つのカレンダーを選択してください';
     if (includedDays.length === 0) return '少なくとも1つの曜日を選択してください';
     return null;
@@ -301,7 +321,10 @@ function App() {
           }
         }
       }
-      const opts = { startDate, endDate, startTime, endTime, includedDays, minDuration, bufferMin, now: new Date() };
+      const opts = {
+        startDate, endDate, startTime, endTime, hoursByDay: effectiveHours(), breaks,
+        includedDays, minDuration, bufferMin, now: new Date(),
+      };
       setBusy(C.mergeIntervals(busyList));
       setFreeTimes(C.computeFreeIntervals(busyList, opts));
       setSearched(opts);
@@ -314,9 +337,15 @@ function App() {
     }
   };
 
+  // 出力に使う最小時間は抽出したときの値（抽出後に設定を変えても結果とずれないように）
+  const outMin = searched ? searched.minDuration : minDuration;
   const outputText = useMemo(
-    () => freeTimes ? C.formatFreeTimes(freeTimes, { format: outputFormat, minDuration, header }) : '',
-    [freeTimes, outputFormat, minDuration, header]);
+    () => freeTimes ? C.formatFreeTimes(freeTimes, { format: outputFormat, minDuration: outMin, maxPerDay, pickBy, header }) : '',
+    [freeTimes, outputFormat, outMin, maxPerDay, pickBy, header]);
+  // タイムラインで「リストに載せた時間」を塗るための候補一覧
+  const listed = useMemo(
+    () => freeTimes ? [...C.listCandidates(freeTimes, { format: outputFormat, minDuration: outMin, maxPerDay, pickBy }).values()].flat() : [],
+    [freeTimes, outputFormat, outMin, maxPerDay, pickBy]);
 
   const copyToClipboard = async () => {
     try {
@@ -348,20 +377,41 @@ function App() {
     h('div', { className: 'grid' },
       h(Field, { label: '開始日' }, h('input', { type: 'date', value: startDate, min: today, onChange: e => setStartDate(e.target.value) })),
       h(Field, { label: '終了日' }, h('input', { type: 'date', value: endDate, min: startDate, max: C.addDays(startDate, MAX_DAYS), onChange: e => setEndDate(e.target.value) })),
-      h(Field, { label: '開始時間' }, h('input', { type: 'time', value: startTime, step: 900, onChange: e => setStartTime(e.target.value) })),
-      h(Field, { label: '終了時間' }, h('input', { type: 'time', value: endTime, step: 900, onChange: e => setEndTime(e.target.value) })),
-      h(Field, { label: '最小ヒマ時間', hint: 'これより短い空きは出さない' },
-        h('select', { value: minDuration, onChange: e => setMinDuration(Number(e.target.value)) },
-          [30, 45, 60, 90, 120, 150, 180].map(v => h('option', { key: v, value: v }, `${v}分`)))),
-      h(Field, { label: '予定の前後の余裕', hint: '移動や準備の時間' },
-        h('select', { value: bufferMin, onChange: e => setBufferMin(Number(e.target.value)) },
-          [0, 10, 15, 30, 60].map(v => h('option', { key: v, value: v }, v ? `${v}分` : 'なし')))),
       h(Field, { label: '曜日', wide: true },
         h('div', { className: 'days' }, C.WEEKDAYS.map((day, i) => h('button', {
           key: i, type: 'button', 'aria-pressed': includedDays.includes(i),
           className: 'day' + (includedDays.includes(i) ? ' on' : '') + (i === 0 ? ' sun' : i === 6 ? ' sat' : ''),
           onClick: () => handleDayToggle(i),
         }, day)))),
+      h('div', { className: 'field wide' },
+        h('div', { className: 'row-between' },
+          h('span', { className: 'field-label' }, '時間帯', h('span', { className: 'hint' }, '候補にしてよい時間')),
+          h('label', { className: 'switch' },
+            h('input', { type: 'checkbox', checked: perDayOn, onChange: e => setPerDayOn(e.target.checked) }),
+            h('span', null, '曜日ごとに設定'))),
+        !perDayOn
+          ? h(TimeRange, { start: startTime, end: endTime, onStart: setStartTime, onEnd: setEndTime })
+          : includedDays.length === 0
+            ? h('p', { className: 'muted small' }, '曜日を選ぶと、ここで曜日ごとの時間帯を設定できます。')
+            : h('div', { className: 'stack' }, includedDays.map(d => h('div', { key: d, className: 'day-hours' },
+              h('span', { className: 'day-name' + (d === 0 ? ' sun' : d === 6 ? ' sat' : '') }, C.WEEKDAYS[d]),
+              h(TimeRange, { start: hoursOf(d).start, end: hoursOf(d).end,
+                onStart: v => setDayHours(d, 'start', v), onEnd: v => setDayHours(d, 'end', v) }))))),
+      h('div', { className: 'field wide' },
+        h('span', { className: 'field-label' }, '除外する時間帯', h('span', { className: 'hint' }, '昼休みなど、毎日候補から外す時間')),
+        breaks.length > 0 && h('div', { className: 'stack' }, breaks.map((b, i) => h('div', { key: i, className: 'day-hours' },
+          h(TimeRange, { start: b.start, end: b.end, onStart: v => updateBreak(i, 'start', v), onEnd: v => updateBreak(i, 'end', v) }),
+          h('button', { type: 'button', className: 'icon-btn', 'aria-label': 'この時間帯を削除', onClick: () => removeBreak(i) }, h(Icon, { d: ICONS.close, size: 16 }))))),
+        h('div', { className: 'presets tight' },
+          !breaks.some(b => b.start === '12:00' && b.end === '13:00') &&
+            h('button', { type: 'button', className: 'chip', onClick: () => addBreak('12:00', '13:00') }, '昼休み 12:00〜13:00 を追加'),
+          h('button', { type: 'button', className: 'chip', onClick: () => addBreak('15:00', '15:30') }, '時間帯を追加'))),
+      h(Field, { label: '最小ヒマ時間', hint: 'これより短い空きは出さない' },
+        h('select', { value: minDuration, onChange: e => setMinDuration(Number(e.target.value)) },
+          [30, 45, 60, 90, 120, 150, 180].map(v => h('option', { key: v, value: v }, `${v}分`)))),
+      h(Field, { label: '予定の前後の余裕', hint: '移動や準備の時間' },
+        h('select', { value: bufferMin, onChange: e => setBufferMin(Number(e.target.value)) },
+          [0, 10, 15, 30, 60].map(v => h('option', { key: v, value: v }, v ? `${v}分` : 'なし')))),
       h(Field, { label: 'カレンダー', hint: '予定を確認するカレンダー', wide: true },
         calendars.length === 0
           ? h('p', { className: 'muted' }, '読み込み中...')
@@ -380,14 +430,22 @@ function App() {
             h('select', { value: outputFormat, onChange: e => setOutputFormat(e.target.value) },
               h('option', { value: 'range' }, '時間範囲'),
               h('option', { value: 'slots' }, '開始時刻の候補（30分刻み）'))),
-          h(Field, { label: '前置き文', hint: '空欄で省略' },
+          h(Field, { label: '1日の候補数', hint: outputFormat === 'slots' ? '開始時刻の数' : '時間帯の数' },
+            h('select', { value: maxPerDay, onChange: e => setMaxPerDay(Number(e.target.value)) },
+              [0, 1, 2, 3, 4, 5].map(v => h('option', { key: v, value: v }, v ? `${v}件まで` : '制限なし')))),
+          maxPerDay > 0 && h(Field, { label: '絞り方' },
+            h('select', { value: pickBy, onChange: e => setPickBy(e.target.value) },
+              h('option', { value: 'spread' }, '1日の中でばらけさせる'),
+              h('option', { value: 'early' }, '早い時間を優先'),
+              h('option', { value: 'long' }, '長い空きを優先'))),
+          h(Field, { label: '前置き文', hint: '空欄で省略', wide: true },
             h('input', { type: 'text', value: header, placeholder: DEFAULT_HEADER, onChange: e => setHeader(e.target.value) }))),
         h('pre', { className: 'output' }, outputText),
         h('div', { className: 'actions' },
           h('button', { className: 'btn primary', onClick: copyToClipboard }, h(Icon, { d: ICONS.copy }), 'コピー'),
           navigator.share && h('button', { className: 'btn ghost', onClick: shareText }, h(Icon, { d: ICONS.share }), '共有'))),
     h('h2', { className: 'mt' }, 'スケジュール'),
-    h(Timeline, { searched, busy, freeTimes }));
+    h(Timeline, { searched, busy, freeTimes, listed }));
 
   return h('div', { className: 'app' },
     menu,
@@ -412,19 +470,32 @@ function App() {
     h(Toast, { message: toast }));
 }
 
-// 30分刻みのタイムライン。空き＝送るリストに入っている時間、短い空き＝最小時間に届かない空き
-function Timeline({ searched, busy, freeTimes }) {
+// 時間帯の入力（開始〜終了）
+function TimeRange({ start, end, onStart, onEnd }) {
+  return h('div', { className: 'time-range' },
+    h('input', { type: 'time', value: start, step: 900, 'aria-label': '開始', onChange: e => onStart(e.target.value) }),
+    h('span', { className: 'muted' }, '〜'),
+    h('input', { type: 'time', value: end, step: 900, 'aria-label': '終了', onChange: e => onEnd(e.target.value) }));
+}
+
+// 30分刻みのタイムライン
+function Timeline({ searched, busy, freeTimes, listed }) {
   if (!searched) return null;
   const days = C.listDays(searched.startDate, searched.endDate, searched.includedDays);
+  const windows = Object.fromEntries(days.map(d => [d, C.dayWindow(searched, C.parseLocal(d).getDay())]));
+  // 表示する行は、全対象日の時間帯をまとめた範囲（30分単位に広げる）
+  const first = days.reduce((m, d) => windows[d].start < m ? windows[d].start : m, '23:59');
+  const last = days.reduce((m, d) => windows[d].end > m ? windows[d].end : m, '00:00');
   const rows = [];
-  for (let t = searched.startTime; t < searched.endTime;) {
-    rows.push(t);
-    const d = C.parseLocal('2000-01-01', t);
-    d.setMinutes(d.getMinutes() + 30 - (d.getMinutes() % 30));
-    t = C.fmtTime(d);
-    if (t === '00:00') break;
+  const cur = C.parseLocal('2000-01-01', first);
+  cur.setMinutes(cur.getMinutes() - (cur.getMinutes() % 30));
+  const lastAt = C.parseLocal('2000-01-01', last);
+  while (cur < lastAt && rows.length < 48) {
+    rows.push(C.fmtTime(cur));
+    cur.setMinutes(cur.getMinutes() + 30);
   }
   const now = searched.now;
+  const breaks = searched.breaks || [];
   return h('div', { className: 'timeline-wrap' },
     h('table', { className: 'timeline' },
       h('thead', null, h('tr', null, h('th', null, ''), days.map(d => {
@@ -432,20 +503,26 @@ function Timeline({ searched, busy, freeTimes }) {
         return h('th', { key: d, className: dow === 0 ? 'sun' : dow === 6 ? 'sat' : '' }, C.fmtDate(C.parseLocal(d)));
       }))),
       h('tbody', null, rows.map((t, ri) => {
-        const next = rows[ri + 1] || searched.endTime;
+        const next = rows[ri + 1] || C.fmtTime(new Date(C.parseLocal('2000-01-01', t).getTime() + 30 * 60000));
         return h('tr', { key: t },
           h('th', null, t.endsWith(':00') ? t : ''),
           days.map(d => {
-            const s = C.parseLocal(d, t), e = C.parseLocal(d, next);
+            const s = C.parseLocal(d, t), e = new Date(s.getTime() + 30 * 60000);
+            const w = windows[d];
+            const outside = e <= C.parseLocal(d, w.start) || s >= C.parseLocal(d, w.end);
+            const inBreak = breaks.some(b => s < C.parseLocal(d, b.end) && e > C.parseLocal(d, b.start));
             let cls = 'short';
             if (e <= now) cls = 'past';
+            else if (outside || inBreak) cls = 'off';
             else if (C.overlapsBusy(s, e, busy)) cls = 'busy';
-            else if (C.isCoveredByFree(s, e, freeTimes)) cls = 'free';
+            else if (listed.some(c => c.start < e && s < c.end)) cls = 'free';
+            else if (C.isCoveredByFree(s, e, freeTimes)) cls = 'unlisted';
             return h('td', { key: d, className: cls, title: `${C.fmtDate(s)} ${t}〜${next}` });
           }));
       }))),
     h('div', { className: 'legend' },
-      [['free', 'ヒマ（リストに掲載）'], ['short', '短い空き・余裕時間'], ['busy', '予定あり'], ['past', '過去']].map(([c, l]) =>
+      [['free', 'リストに掲載'], ['unlisted', '空き（候補から外した）'], ['short', '短い空き・余裕時間'],
+        ['busy', '予定あり'], ['off', '対象外の時間'], ['past', '過去']].map(([c, l]) =>
         h('span', { key: c }, h('i', { className: c }), l))));
 }
 

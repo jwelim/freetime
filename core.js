@@ -66,32 +66,48 @@
     return new Date(dayStart + Math.ceil(offset / step) * step);
   }
 
+  // その曜日の対象時間帯を返す（曜日ごとの設定があれば優先）
+  function dayWindow(o, dow) {
+    const w = o.hoursByDay && o.hoursByDay[dow];
+    return w ? { start: w.start, end: w.end } : { start: o.startTime, end: o.endTime };
+  }
+
   /**
    * 空き時間を求める。
-   * 各対象日の [開始時刻, 終了時刻] の窓から予定を差し引き、
+   * 各対象日の [開始時刻, 終了時刻] の窓から予定と除外時間帯（昼休みなど）を差し引き、
    * minDuration 分以上続く区間だけを返す（区間は分割しない）。
    *
    * @param {Array<{start:Date,end:Date}>} busy 予定
    * @param {object} o
    *   startDate/endDate 'YYYY-MM-DD', startTime/endTime 'HH:MM',
+   *   hoursByDay {曜日番号: {start,end}} 曜日ごとの時間帯（省略時は startTime/endTime）,
+   *   breaks [{start:'HH:MM', end:'HH:MM'}] 毎日除外する時間帯,
    *   includedDays 曜日番号の配列, minDuration 分,
    *   bufferMin 予定の前後に確保する分数, now この時刻より前は除外, roundMin 開始時刻の丸め単位
    * @returns {Array<{start:Date,end:Date}>}
    */
   function computeFreeIntervals(busy, o) {
     const {
-      startDate, endDate, startTime, endTime, includedDays,
+      startDate, endDate, includedDays, breaks = [],
       minDuration, bufferMin = 0, now = null, roundMin = 15,
     } = o;
     const buf = bufferMin * MS_MIN;
-    const blocked = mergeIntervals(busy.map(b => ({
-      start: new Date(new Date(b.start).getTime() - buf),
-      end: new Date(new Date(b.end).getTime() + buf),
-    })));
+    const days = listDays(startDate, endDate, includedDays);
+    // 予定には前後の余裕を付ける。除外時間帯は自分の都合なので余裕は付けない
+    const blocked = mergeIntervals([
+      ...busy.map(b => ({
+        start: new Date(new Date(b.start).getTime() - buf),
+        end: new Date(new Date(b.end).getTime() + buf),
+      })),
+      ...days.flatMap(day => breaks
+        .filter(br => br.start && br.end && br.end > br.start)
+        .map(br => ({ start: parseLocal(day, br.start), end: parseLocal(day, br.end) }))),
+    ]);
     const result = [];
-    for (const day of listDays(startDate, endDate, includedDays)) {
-      let winStart = parseLocal(day, startTime);
-      const winEnd = parseLocal(day, endTime);
+    for (const day of days) {
+      const win = dayWindow(o, parseLocal(day).getDay());
+      let winStart = parseLocal(day, win.start);
+      const winEnd = parseLocal(day, win.end);
       if (now && winStart < now) winStart = ceilToStep(now, roundMin);
       if (winStart >= winEnd) continue;
 
@@ -126,27 +142,61 @@
     return map;
   }
 
+  // n 件を選ぶ。early=早い順 / long=長い空きを優先 / spread=1日の中でばらけさせる
+  function pick(items, n, by) {
+    if (!n || items.length <= n) return items;
+    let chosen;
+    if (by === 'long') {
+      chosen = [...items].sort((a, b) => (b.span - a.span) || (a.start - b.start)).slice(0, n);
+    } else if (by === 'spread') {
+      const idx = new Set();
+      for (let k = 0; k < n; k++) idx.add(n === 1 ? 0 : Math.round(k * (items.length - 1) / (n - 1)));
+      chosen = items.filter((_, i) => idx.has(i));
+    } else {
+      chosen = items.slice(0, n);
+    }
+    return chosen.sort((a, b) => a.start - b.start); // 表示は時刻順
+  }
+
   /**
-   * 相手に送るテキストを組み立てる。
-   * format: 'range' … 「10/20(月) 09:00〜12:00 / 14:00〜17:00」
-   *         'slots' … minDuration の枠を30分刻みで開始できる時刻を列挙
+   * 相手に出す候補を日付ごとに作る。
+   * format: 'range' … 空き区間そのものが候補
+   *         'slots' … minDuration の枠を30分刻みで開始できる時刻が候補（end = 開始 + minDuration）
+   * maxPerDay（0 で無制限）を超える日は pickBy の方針で絞る。
+   * @returns {Map<'YYYY-MM-DD', Array<{start:Date,end:Date}>>}
    */
-  function formatFreeTimes(intervals, { format = 'range', minDuration = 60, header = '', footer = '' } = {}) {
-    const lines = [];
-    for (const [, list] of groupByDate(intervals)) {
-      const label = fmtDate(list[0].start);
+  function listCandidates(intervals, { format = 'range', minDuration = 60, maxPerDay = 0, pickBy = 'early' } = {}) {
+    const out = new Map();
+    for (const [key, list] of groupByDate(intervals)) {
+      let items;
       if (format === 'slots') {
-        const starts = [];
+        items = [];
         for (const i of list) {
           for (let t = ceilToStep(i.start, 30); t.getTime() + minDuration * MS_MIN <= i.end.getTime();
             t = new Date(t.getTime() + 30 * MS_MIN)) {
-            starts.push(fmtTime(t));
+            items.push({ start: t, end: new Date(t.getTime() + minDuration * MS_MIN), span: i.end - i.start });
           }
         }
-        if (starts.length) lines.push(`・${label} ${starts.join('、')}`);
       } else {
-        lines.push(`・${label} ${list.map(i => `${fmtTime(i.start)}〜${fmtTime(i.end)}`).join(' / ')}`);
+        items = list.map(i => ({ start: i.start, end: i.end, span: i.end - i.start }));
       }
+      const chosen = pick(items, maxPerDay, pickBy).map(({ start, end }) => ({ start, end }));
+      if (chosen.length) out.set(key, chosen);
+    }
+    return out;
+  }
+
+  /**
+   * 相手に送るテキストを組み立てる。
+   * 'range' …「10/20(月) 09:00〜12:00 / 14:00〜17:00」、'slots' …「10/20(月) 09:00、09:30」
+   */
+  function formatFreeTimes(intervals, { format = 'range', minDuration = 60, maxPerDay = 0, pickBy = 'early', header = '', footer = '' } = {}) {
+    const lines = [];
+    for (const [, list] of listCandidates(intervals, { format, minDuration, maxPerDay, pickBy })) {
+      const label = fmtDate(list[0].start);
+      lines.push(format === 'slots'
+        ? `・${label} ${list.map(i => fmtTime(i.start)).join('、')}`
+        : `・${label} ${list.map(i => `${fmtTime(i.start)}〜${fmtTime(i.end)}`).join(' / ')}`);
     }
     const parts = [];
     if (header.trim()) parts.push(header.trim());
@@ -168,7 +218,7 @@
 
   return {
     WEEKDAYS, toDateStr, parseLocal, addDays, listDays, mergeIntervals, ceilToStep,
-    computeFreeIntervals, formatFreeTimes, groupByDate, fmtTime, fmtDate,
+    computeFreeIntervals, dayWindow, listCandidates, formatFreeTimes, groupByDate, fmtTime, fmtDate,
     isCoveredByFree, overlapsBusy,
   };
 });
