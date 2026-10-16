@@ -1,736 +1,467 @@
-const {
-  useState,
-  useEffect,
-  useRef
-} = React;
-const CLIENT_ID = '267244090541-l41q931ig7rr9rhktn3sk3dkekljrpj9.apps.googleusercontent.com';
-const API_KEY = 'AIzaSyCrVxI0mUvTptWE5CnrXQmQy84H2SEROZk';
-const SCOPES = 'https://www.googleapis.com/auth/calendar.readonly';
-const DISCOVERY_DOC = 'https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest';
+// ヒマリスト本体
+// ビルド不要で動かすため JSX は使わず React.createElement（h）で書く。
+// 計算ロジックは core.js（window.FreetimeCore）に分離している。
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
+const h = React.createElement;
+const C = window.FreetimeCore;
 
-// カスタムCSSをインラインで追加
-const style = document.createElement('style');
-style.textContent = `
-    @keyframes fadeIn {
-        from { opacity: 0; transform: translateY(10px); }
-        to { opacity: 1; transform: translateY(0); }
-    }
-    .animate-fadeIn {
-        animation: fadeIn 0.5s ease-out forwards;
-    }
-    .custom-scrollbar::-webkit-scrollbar {
-        width: 6px;
-        height: 6px;
-    }
-    .custom-scrollbar::-webkit-scrollbar-track {
-        background: rgba(255, 255, 255, 0.1);
-        border-radius: 10px;
-    }
-    .custom-scrollbar::-webkit-scrollbar-thumb {
-        background: rgba(255, 255, 255, 0.3);
-        border-radius: 10px;
-    }
-    .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-        background: rgba(255, 255, 255, 0.5);
-    }
-    .hover\\:border-4B5EAA:hover {
-        border-color: #4B5EAA !important;
-    }
-    .hover\\:bg-gray-600:hover {
-        background-color: #374151 !important;
-    }
-    .hover\\:bg-gray-700:hover {
-        background-color: #2F333A !important;
-    }
-    .hover\\:bg-gray-200:hover {
-        background-color: #4B5563 !important;
-    }
-    @media (max-width: 640px) {
-        .mobile-no-scroll {
-            max-width: 100vw;
-            overflow-x: hidden;
-        }
-        .mobile-no-scroll > * {
-            max-width: 100%;
-            overflow-x: auto;
-        }
-    }
-    .notion-dark {
-        background-color: #202226;
-        color: #D1D5DB;
-    }
-    .element-bg {
-        background-color: #2e3033;
-    }
-    .custom-button {
-        background: linear-gradient(to right, #6d9eeb, #6fa8dc);
-        color: #D1D5DB;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
-        transition: transform 0.1s ease, box-shadow 0.1s ease, background 0.3s ease;
-    }
-    .custom-button:hover {
-        background: linear-gradient(to right, #5b88d6, #5d95c3);
-    }
-    .custom-button:active {
-        transform: translateY(2px);
-        box-shadow: 0 2px 3px rgba(0, 0, 0, 0.2);
-    }
-    .timeline-date {
-        white-space: nowrap;
-        text-align: center;
-    }
-    .day-checkbox {
-        display: none;
-    }
-    .day-label {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        width: 2rem;
-        height: 2rem;
-        border: 1px solid #ffffff;
-        border-radius: 50%;
-        color: #ffffff;
-        cursor: pointer;
-        background: linear-gradient(to right, #6d9eeb, #6fa8dc);
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
-        transition: transform 0.1s ease, box-shadow 0.1s ease, background 0.3s ease;
-        text-align: center;
-        pointer-events: auto;
-    }
-    .day-checkbox:not(:checked) + .day-label {
-        background: transparent;
-    }
-    .day-label:hover {
-        background: linear-gradient(to right, #5b88d6, #5d95c3);
-    }
-    .day-label:active {
-        transform: translateY(2px);
-        box-shadow: 0 2px 3px rgba(0, 0, 0, 0.2);
-    }
-    .tooltip {
-        position: relative;
-    }
-    .tooltip .tooltip-text {
-        visibility: hidden;
-        width: 200px;
-        background-color: #374151;
-        color: #D1D5DB;
-        text-align: center;
-        border-radius: 6px;
-        padding: 5px;
-        position: absolute;
-        z-index: 1;
-        bottom: 125%;
-        left: 50%;
-        margin-left: -100px;
-        opacity: 0;
-        transition: opacity 0.3s;
-        font-size: 0.75rem;
-    }
-    .tooltip:hover .tooltip-text {
-        visibility: visible;
-        opacity: 1;
-    }
-`;
-document.head.appendChild(style);
+const CLIENT_ID = '267244090541-l41q931ig7rr9rhktn3sk3dkekljrpj9.apps.googleusercontent.com';
+// 読み取りのみ。freeBusy は予定の中身（タイトル等）を返さない。
+const SCOPES = 'https://www.googleapis.com/auth/calendar.readonly';
+const API = 'https://www.googleapis.com/calendar/v3';
+const MAX_DAYS = 40;
+const DEFAULT_HEADER = '以下の日程でご都合いかがでしょうか。';
+const IS_DEMO = new URLSearchParams(location.search).has('demo');
+
+// ---------- 保存（localStorage が使えない環境でも落ちないようにする） ----------
+const store = {
+  get(key, fallback) {
+    try {
+      const v = localStorage.getItem('freetime:' + key);
+      return v == null ? fallback : JSON.parse(v);
+    } catch { return fallback; }
+  },
+  set(key, value) {
+    try { localStorage.setItem('freetime:' + key, JSON.stringify(value)); } catch { /* 無視 */ }
+  },
+};
+
+// 設定値を localStorage に保存する useState
+function usePersistent(key, initial) {
+  const [value, setValue] = useState(() => store.get(key, initial));
+  useEffect(() => { store.set(key, value); }, [key, value]);
+  return [value, setValue];
+}
+
+// ---------- Google 認証（Google Identity Services のトークンクライアント） ----------
+// アクセストークンは URL にもログにも出さず、タブを閉じるまで sessionStorage にだけ置く。
+const tokenStore = {
+  load() {
+    try {
+      const t = JSON.parse(sessionStorage.getItem('freetime:token') || 'null');
+      return t && t.expiresAt > Date.now() + 60 * 1000 ? t : null;
+    } catch { return null; }
+  },
+  save(t) { try { sessionStorage.setItem('freetime:token', JSON.stringify(t)); } catch { /* 無視 */ } },
+  clear() { try { sessionStorage.removeItem('freetime:token'); } catch { /* 無視 */ } },
+};
+
+function waitForGis(timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    (function poll() {
+      if (window.google?.accounts?.oauth2) return resolve(window.google.accounts.oauth2);
+      if (Date.now() - started > timeoutMs) return reject(new Error('Googleログインの読み込みに失敗しました。通信環境や広告ブロッカーを確認してください。'));
+      setTimeout(poll, 100);
+    })();
+  });
+}
+
+// トークンを要求する。interactive=false のときは同意画面を出さず再取得を試みる。
+async function requestToken(interactive) {
+  const oauth2 = await waitForGis();
+  return new Promise((resolve, reject) => {
+    const client = oauth2.initTokenClient({
+      client_id: CLIENT_ID,
+      scope: SCOPES,
+      callback: res => {
+        if (res.error) return reject(new Error(res.error_description || res.error));
+        const t = { accessToken: res.access_token, expiresAt: Date.now() + Number(res.expires_in) * 1000 };
+        tokenStore.save(t);
+        resolve(t);
+      },
+      error_callback: err => reject(new Error(err.type === 'popup_closed' ? 'ログインがキャンセルされました' : (err.message || 'ログインに失敗しました'))),
+    });
+    client.requestAccessToken({ prompt: interactive ? '' : 'none' });
+  });
+}
+
+// Calendar API 呼び出し。401 のときはトークンを取り直して1回だけ再試行する。
+async function callApi(path, { method = 'GET', body } = {}, retry = true) {
+  let token = tokenStore.load();
+  if (!token) token = await requestToken(false).catch(() => requestToken(true));
+  const res = await fetch(API + path, {
+    method,
+    headers: { Authorization: 'Bearer ' + token.accessToken, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (res.status === 401 && retry) {
+    tokenStore.clear();
+    return callApi(path, { method, body }, false);
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.error?.message || `Google API エラー（${res.status}）`);
+  return data;
+}
+
+// ---------- デモ用データ（?demo を付けて開くとログインなしで試せる） ----------
+const demo = {
+  calendars: [
+    { id: 'demo-main', summary: 'デモ用カレンダー', backgroundColor: '#6d9eeb', primary: true },
+    { id: 'demo-work', summary: '仕事（デモ）', backgroundColor: '#e06666' },
+  ],
+  busy(startDate, endDate) {
+    const out = [];
+    const days = C.listDays(startDate, endDate, [0, 1, 2, 3, 4, 5, 6]);
+    days.forEach((d, i) => {
+      const at = (t1, t2) => out.push({ start: C.parseLocal(d, t1), end: C.parseLocal(d, t2) });
+      if (i % 3 === 0) at('10:00', '11:30');
+      if (i % 2 === 1) at('13:00', '14:15');
+      if (i % 4 === 2) at('09:00', '12:00');
+      if (i % 5 === 4) at('15:30', '17:00');
+      at('12:00', '12:45');
+    });
+    return out;
+  },
+};
+
+// ---------- 小さな部品 ----------
+const Icon = ({ d, size = 18 }) => h('svg', {
+  width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
+  strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true,
+}, d.map((p, i) => h('path', { key: i, d: p })));
+const ICONS = {
+  menu: ['M4 6h16', 'M4 12h16', 'M4 18h16'],
+  close: ['M6 6l12 12', 'M18 6L6 18'],
+  copy: ['M9 9h11v11H9z', 'M5 15H4V4h11v1'],
+  share: ['M12 3v12', 'M7 8l5-5 5 5', 'M5 13v7h14v-7'],
+};
+
+const Field = ({ label, hint, children, wide }) => h('label', { className: 'field' + (wide ? ' wide' : '') },
+  h('span', { className: 'field-label' }, label, hint && h('span', { className: 'hint' }, hint)),
+  children);
+
+function Toast({ message }) {
+  return h('div', { className: 'toast' + (message ? ' show' : ''), role: 'status', 'aria-live': 'polite' }, message);
+}
+
+// ---------- 本体 ----------
 function App() {
-  const [isSignedIn, setIsSignedIn] = useState(false);
+  const today = C.toDateStr(new Date());
+  const [isSignedIn, setIsSignedIn] = useState(IS_DEMO || !!tokenStore.load());
   const [calendars, setCalendars] = useState([]);
-  const [selectedCalendars, setSelectedCalendars] = useState([]);
-  const [startDate, setStartDate] = useState(() => new Date().toISOString().split('T')[0]);
-  const [endDate, setEndDate] = useState(() => {
-    const date = new Date();
-    date.setDate(date.getDate() + 7);
-    return date.toISOString().split('T')[0];
-  });
-  const [maxEndDate, setMaxEndDate] = useState(() => {
-    const date = new Date();
-    date.setDate(date.getDate() + 40);
-    return date.toISOString().split('T')[0];
-  });
-  const [startTime, setStartTime] = useState('09:00');
-  const [endTime, setEndTime] = useState('17:00');
-  const [minDuration, setMinDuration] = useState(60);
-  const [includedDays, setIncludedDays] = useState([1, 2, 3, 4, 5]);
-  const [outputFormat, setOutputFormat] = useState('range');
-  const [freeTimes, setFreeTimes] = useState([]);
-  const [events, setEvents] = useState([]);
+  const [selectedCalendars, setSelectedCalendars] = usePersistent('calendars', []);
+  const [startDate, setStartDate] = useState(today);
+  const [endDate, setEndDate] = useState(C.addDays(today, 7));
+  const [startTime, setStartTime] = usePersistent('startTime', '09:00');
+  const [endTime, setEndTime] = usePersistent('endTime', '17:00');
+  const [minDuration, setMinDuration] = usePersistent('minDuration', 60);
+  const [bufferMin, setBufferMin] = usePersistent('bufferMin', 0);
+  const [includedDays, setIncludedDays] = usePersistent('days', [1, 2, 3, 4, 5]);
+  const [outputFormat, setOutputFormat] = usePersistent('format', 'range');
+  const [header, setHeader] = usePersistent('header', DEFAULT_HEADER);
+  const [busy, setBusy] = useState([]);
+  const [freeTimes, setFreeTimes] = useState(null); // null = 未実行
+  const [searched, setSearched] = useState(null); // 抽出時の条件（タイムライン表示用）
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [isUsageOpen, setIsUsageOpen] = useState(false);
   const [usageGuide, setUsageGuide] = useState(null);
-  const [isGuideLoading, setIsGuideLoading] = useState(true);
-  const [hasScrolled, setHasScrolled] = useState(false);
-  const [isGapiInitialized, setIsGapiInitialized] = useState(false);
-  const freeTimesRef = useRef(null);
-  useEffect(() => {
-    const start = new Date(startDate);
-    const maxDate = new Date(start);
-    maxDate.setDate(start.getDate() + 40);
-    setMaxEndDate(maxDate.toISOString().split('T')[0]);
-    const currentEndDate = new Date(endDate);
-    if (currentEndDate > maxDate) {
-      setEndDate(maxDate.toISOString().split('T')[0]);
-    }
-  }, [startDate]);
-  useEffect(() => {
-    function initClient() {
-      if (!window.gapi) {
-        setError('Google APIライブラリが読み込まれていません');
-        console.error('Google APIライブラリが利用できません');
-        return;
-      }
-      gapi.load('client', () => {
-        gapi.client.init({
-          apiKey: API_KEY,
-          discoveryDocs: [DISCOVERY_DOC]
-        }).then(() => {
-          console.log('Google APIクライアント初期化成功');
-          setIsGapiInitialized(true);
-        }).catch(error => {
-          console.error('Google API初期化エラー:', JSON.stringify(error, null, 2));
-          setError('Google APIの初期化に失敗しました: ' + JSON.stringify(error, null, 2));
-        });
-      });
-    }
-    initClient();
-    setIsGuideLoading(true);
-    fetch('./usage-guide.json').then(response => {
-      if (!response.ok) throw new Error('JSONの取得に失敗しました');
-      return response.json();
-    }).then(data => setUsageGuide(data)).catch(error => {
-      console.error('使い方ガイドの読み込みエラー:', error);
-      setError('使い方ガイドの読み込みに失敗しました: ' + error.message);
-    }).finally(() => setIsGuideLoading(false));
+  const [toast, setToast] = useState('');
+  const resultRef = useRef(null);
+  const toastTimer = useRef(null);
+
+  const showToast = useCallback(msg => {
+    setToast(msg);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(''), 2200);
   }, []);
+
+  // 使い方ガイドは開いたときに読み込む（失敗してもメイン画面にエラーを出さない）
   useEffect(() => {
-    if (!isGapiInitialized) return;
-    const urlParams = new URLSearchParams(window.location.hash.substring(1));
-    const accessToken = urlParams.get('access_token');
-    if (accessToken) {
-      console.log('リダイレクトからトークンを取得:', accessToken);
+    if (!isUsageOpen || usageGuide) return;
+    fetch('./usage-guide.json')
+      .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+      .then(setUsageGuide)
+      .catch(() => setUsageGuide({ title: '使い方ガイド', description: 'ガイドを読み込めませんでした。' }));
+  }, [isUsageOpen, usageGuide]);
+
+  // Esc でメニュー・ガイドを閉じる
+  useEffect(() => {
+    const onKey = e => { if (e.key === 'Escape') { setIsMenuOpen(false); setIsUsageOpen(false); } };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  // ログイン後にカレンダー一覧を取得
+  useEffect(() => {
+    if (!isSignedIn) return;
+    if (IS_DEMO) { applyCalendars(demo.calendars); return; }
+    callApi('/users/me/calendarList?minAccessRole=freeBusyReader&maxResults=250')
+      .then(data => applyCalendars(data.items || []))
+      .catch(e => { setError('カレンダーの取得に失敗しました: ' + e.message); });
+  }, [isSignedIn]);
+
+  function applyCalendars(items) {
+    const list = items
+      .filter(c => !c.hidden)
+      .sort((a, b) => (b.primary ? 1 : 0) - (a.primary ? 1 : 0));
+    setCalendars(list);
+    // 保存済みの選択のうち、今も存在するものだけ残す。無ければメインカレンダーを選ぶ
+    setSelectedCalendars(prev => {
+      const kept = prev.filter(id => list.some(c => c.id === id));
+      if (kept.length) return kept;
+      const primary = list.find(c => c.primary) || list[0];
+      return primary ? [primary.id] : [];
+    });
+  }
+
+  const handleSignIn = async () => {
+    setError(null);
+    try {
+      await requestToken(true);
       setIsSignedIn(true);
-      gapi.client.setToken({
-        access_token: accessToken
-      });
-      gapi.client.calendar.calendarList.list().then(response => {
-        setCalendars(response.result.items);
-        window.history.replaceState({}, document.title, window.location.pathname);
-      }).catch(error => {
-        console.error('カレンダー取得エラー:', error);
-        setError('カレンダーの取得に失敗しました: ' + error.message);
-      });
+    } catch (e) {
+      setError(e.message);
     }
-  }, [isGapiInitialized]);
-  useEffect(() => {
-    if (freeTimes.length > 0 && !hasScrolled && freeTimesRef.current) {
-      freeTimesRef.current.scrollIntoView({
-        behavior: 'smooth'
-      });
-      setHasScrolled(true);
-    }
-  }, [freeTimes, hasScrolled]);
-  const handleSignIn = () => {
-    if (!window.gapi) {
-      setError('Google APIライブラリが読み込まれていません');
-      return;
-    }
-    const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?` + `client_id=${encodeURIComponent(CLIENT_ID)}&` + `redirect_uri=${encodeURIComponent('https://jwelim.github.io/freetime/')}&` + `response_type=token&` + `scope=${encodeURIComponent(SCOPES)}&` + `prompt=consent`;
-    window.location.href = authUrl;
   };
+
   const handleSignOut = () => {
-    if (!window.gapi || !gapi.client) {
-      setError('Google APIライブラリが利用できません');
-      return;
-    }
-    gapi.client.setToken(null);
+    const t = tokenStore.load();
+    if (t && window.google?.accounts?.oauth2) window.google.accounts.oauth2.revoke(t.accessToken, () => {});
+    tokenStore.clear();
     setIsSignedIn(false);
     setCalendars([]);
-    setFreeTimes([]);
-    setEvents([]);
+    setFreeTimes(null);
+    setBusy([]);
     setError(null);
-    setHasScrolled(false);
-    console.log('ログアウト成功');
     setIsMenuOpen(false);
+    if (IS_DEMO) location.search = '';
   };
+
   const handleDayToggle = day => {
-    setIncludedDays(prev => prev.includes(day) ? prev.filter(d => d !== day) : [...prev, day].sort());
+    setIncludedDays(prev => prev.includes(day) ? prev.filter(d => d !== day) : [...prev, day].sort((a, b) => a - b));
   };
+
+  const toggleCalendar = id => {
+    setSelectedCalendars(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  };
+
+  // 期間のプリセット
+  const setPreset = kind => {
+    const d = new Date();
+    const dow = d.getDay(); // 0=日
+    if (kind === 'thisWeek') {
+      setStartDate(today);
+      setEndDate(C.addDays(today, (7 - dow) % 7)); // 今日〜日曜
+    } else if (kind === 'nextWeek') {
+      const nextMon = C.addDays(today, ((8 - dow) % 7) || 7);
+      setStartDate(nextMon);
+      setEndDate(C.addDays(nextMon, 6));
+    } else {
+      setStartDate(today);
+      setEndDate(C.addDays(today, Number(kind)));
+    }
+  };
+
+  const validate = () => {
+    if (!startDate || !endDate) return '開始日と終了日を選択してください';
+    if (endDate < startDate) return '終了日は開始日以降にしてください';
+    if (C.listDays(startDate, endDate, [0, 1, 2, 3, 4, 5, 6]).length > MAX_DAYS + 1) return `期間は${MAX_DAYS}日以内にしてください`;
+    if (endDate < today) return '期間がすべて過去になっています';
+    if (endTime <= startTime) return '終了時間は開始時間より後にしてください';
+    if (selectedCalendars.length === 0) return '少なくとも1つのカレンダーを選択してください';
+    if (includedDays.length === 0) return '少なくとも1つの曜日を選択してください';
+    return null;
+  };
+
   const fetchFreeTimes = async () => {
-    if (!window.gapi || !gapi.client) {
-      setError('Google APIライブラリが利用できません');
-      setLoading(false);
-      return;
-    }
+    const msg = validate();
+    if (msg) { setError(msg); return; }
     setLoading(true);
-    setFreeTimes([]);
-    setEvents([]);
     setError(null);
-    if (!startDate || !endDate) {
-      setError('開始日と終了日を選択してください');
-      setLoading(false);
-      return;
-    }
-    if (selectedCalendars.length === 0) {
-      setError('少なくとも1つのカレンダーを選択してください');
-      setLoading(false);
-      return;
-    }
-    if (includedDays.length === 0) {
-      setError('少なくとも1つの曜日を選択してください');
-      setLoading(false);
-      return;
-    }
-    const startDateTime = new Date(`${startDate}T${startTime}:00`);
-    const endDateTime = new Date(`${endDate}T${endTime}:00`);
     try {
-      const allEvents = [];
-      for (const calendarId of selectedCalendars) {
-        const response = await gapi.client.calendar.events.list({
-          calendarId: calendarId,
-          timeMin: startDateTime.toISOString(),
-          timeMax: endDateTime.toISOString(),
-          singleEvents: true,
-          orderBy: 'startTime'
-        });
-        if (!response.result || !response.result.items) {
-          throw new Error(`カレンダー ${calendarId} のイベント取得に失敗しました`);
-        }
-        console.log(`カレンダー ${calendarId} のイベント数: ${response.result.items.length}`);
-        const calendarEvents = response.result.items.map(event => {
-          const start = new Date(event.start.dateTime || event.start.date);
-          const end = new Date(event.end.dateTime || event.end.date);
-          if (isNaN(start.getTime()) || isNaN(end.getTime())) {
-            console.warn(`無効なイベント（ID: ${event.id}）をスキップ:`, event);
-            return null;
-          }
-          return {
-            start,
-            end
-          };
-        }).filter(event => event !== null);
-        allEvents.push(...calendarEvents);
-      }
-      setEvents(allEvents);
-      const freeSlots = [];
-      let current = new Date(startDateTime);
-      while (current < endDateTime) {
-        if (!includedDays.includes(current.getDay())) {
-          current.setDate(current.getDate() + 1);
-          current.setHours(parseInt(startTime.split(':')[0]), parseInt(startTime.split(':')[1]), 0, 0);
-          continue;
-        }
-        const nextDay = new Date(current);
-        nextDay.setDate(nextDay.getDate() + 1);
-        nextDay.setHours(parseInt(startTime.split(':')[0]), parseInt(startTime.split(':')[1]), 0, 0);
-        const dayEnd = new Date(current);
-        dayEnd.setHours(parseInt(endTime.split(':')[0]), parseInt(endTime.split(':')[1]), 0, 0);
-        while (current < dayEnd && current < endDateTime) {
-          const slotEnd = new Date(current.getTime() + minDuration * 60 * 1000);
-          if (slotEnd > dayEnd) break;
-          const isFree = !allEvents.some(event => {
-            if (!event.start.getHours() && !event.start.getMinutes()) {
-              const eventDate = event.start.toISOString().split('T')[0];
-              const slotDate = current.toISOString().split('T')[0];
-              return eventDate === slotDate;
-            }
-            return current < event.end && slotEnd > event.start;
+      const timeMin = C.parseLocal(startDate, '00:00');
+      const timeMax = C.parseLocal(C.addDays(endDate, 1), '00:00');
+      let busyList;
+      if (IS_DEMO) {
+        await new Promise(r => setTimeout(r, 400));
+        busyList = demo.busy(startDate, endDate);
+      } else {
+        // freeBusy は複数カレンダーを1回で問い合わせられ、
+        // 「予定なし（透過）」の予定や辞退した予定を自動で除外してくれる。上限50件。
+        busyList = [];
+        for (let i = 0; i < selectedCalendars.length; i += 50) {
+          const data = await callApi('/freeBusy', {
+            method: 'POST',
+            body: {
+              timeMin: timeMin.toISOString(),
+              timeMax: timeMax.toISOString(),
+              timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+              items: selectedCalendars.slice(i, i + 50).map(id => ({ id })),
+            },
           });
-          if (isFree) {
-            freeSlots.push({
-              start: new Date(current),
-              end: new Date(slotEnd)
-            });
+          for (const [id, cal] of Object.entries(data.calendars || {})) {
+            if (cal.errors?.length) {
+              const name = calendars.find(c => c.id === id)?.summary || id;
+              throw new Error(`「${name}」を読み取れませんでした（${cal.errors[0].reason}）`);
+            }
+            for (const b of cal.busy || []) busyList.push({ start: new Date(b.start), end: new Date(b.end) });
           }
-          current = slotEnd;
         }
-        current = nextDay;
       }
-      setFreeTimes(freeSlots);
-    } catch (error) {
-      console.error('ヒマ時間取得エラー:', error);
-      setError('ヒマ時間の取得に失敗しました: ' + error.message);
+      const opts = { startDate, endDate, startTime, endTime, includedDays, minDuration, bufferMin, now: new Date() };
+      setBusy(C.mergeIntervals(busyList));
+      setFreeTimes(C.computeFreeIntervals(busyList, opts));
+      setSearched(opts);
+      setTimeout(() => resultRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50);
+    } catch (e) {
+      console.error('ヒマ時間取得エラー:', e);
+      setError('ヒマ時間の取得に失敗しました: ' + e.message);
     } finally {
       setLoading(false);
     }
   };
-  const formatFreeTimes = () => {
-    if (outputFormat === 'range') {
-      const mergedSlots = [];
-      let currentSlot = null;
-      freeTimes.forEach(slot => {
-        if (!currentSlot) {
-          currentSlot = {
-            start: slot.start,
-            end: slot.end
-          };
-        } else if (currentSlot.end.getTime() === slot.start.getTime()) {
-          currentSlot.end = slot.end;
-        } else {
-          mergedSlots.push(currentSlot);
-          currentSlot = {
-            start: slot.start,
-            end: slot.end
-          };
-        }
-      });
-      if (currentSlot) {
-        mergedSlots.push(currentSlot);
-      }
-      const groupedByDate = mergedSlots.reduce((acc, slot) => {
-        const date = slot.start.toLocaleDateString('ja-JP', {
-          weekday: 'short',
-          month: 'long',
-          day: 'numeric'
-        });
-        if (!acc[date]) acc[date] = [];
-        acc[date].push(`${slot.start.toLocaleTimeString('ja-JP', {
-          hour: '2-digit',
-          minute: '2-digit'
-        })}〜${slot.end.toLocaleTimeString('ja-JP', {
-          hour: '2-digit',
-          minute: '2-digit'
-        })}`);
-        return acc;
-      }, {});
-      return Object.entries(groupedByDate).map(([date, times]) => `- ${date} ${times.join(' / ')}`).join('\n');
-    } else {
-      const groupedByDate = freeTimes.reduce((acc, slot) => {
-        const date = slot.start.toLocaleDateString('ja-JP', {
-          weekday: 'short',
-          month: 'long',
-          day: 'numeric'
-        });
-        if (!acc[date]) acc[date] = [];
-        let current = new Date(slot.start);
-        while (current < slot.end) {
-          acc[date].push(current.toLocaleTimeString('ja-JP', {
-            hour: '2-digit',
-            minute: '2-digit'
-          }));
-          current.setMinutes(current.getMinutes() + 30);
-        }
-        return acc;
-      }, {});
-      return Object.entries(groupedByDate).map(([date, times]) => `- ${date} ${times.join('、')}`).join('\n');
+
+  const outputText = useMemo(
+    () => freeTimes ? C.formatFreeTimes(freeTimes, { format: outputFormat, minDuration, header }) : '',
+    [freeTimes, outputFormat, minDuration, header]);
+
+  const copyToClipboard = async () => {
+    try {
+      await navigator.clipboard.writeText(outputText);
+      showToast('コピーしました');
+    } catch {
+      setError('クリップボードへのコピーに失敗しました。テキストを選択してコピーしてください。');
     }
   };
-  const copyToClipboard = () => {
-    navigator.clipboard.writeText(formatFreeTimes()).then(() => {
-      alert('クリップボードにコピーしました！');
-    }).catch(error => {
-      console.error('コピーエラー:', error);
-      setError('クリップボードへのコピーに失敗しました');
-    });
+
+  const shareText = async () => {
+    try { await navigator.share({ text: outputText }); } catch { /* キャンセル時は何もしない */ }
   };
-  const renderTimeline = () => {
-    const timeline = [];
-    const startHour = parseInt(startTime.split(':')[0]);
-    const endHour = parseInt(endTime.split(':')[0]);
-    const dateRange = [];
-    let currentDate = new Date(startDate);
-    const end = new Date(endDate);
-    while (currentDate <= end) {
-      if (includedDays.includes(currentDate.getDay())) {
-        dateRange.push(new Date(currentDate));
-      }
-      currentDate.setDate(currentDate.getDate() + 1);
-    }
-    for (let hour = startHour; hour <= endHour; hour++) {
-      const row = /*#__PURE__*/React.createElement("tr", {
-        key: hour
-      }, /*#__PURE__*/React.createElement("td", {
-        className: "p-1 text-xs whitespace-nowrap bg-gray-700 text-gray-200",
-        style: {
-          border: '1px solid #374151'
-        }
-      }, `${hour}:00`), dateRange.map(date => {
-        const slotStart = new Date(date);
-        slotStart.setHours(hour, 0, 0, 0);
-        const slotEnd = new Date(slotStart);
-        slotEnd.setHours(hour + 1, 0, 0, 0);
-        const isBusy = events.some(event => slotStart < event.end && slotEnd > event.start);
-        return /*#__PURE__*/React.createElement("td", {
-          key: `${date.toISOString()}-${hour}`,
-          className: "p-1 text-xs text-center",
-          style: {
-            border: '1px solid #374151',
-            backgroundColor: isBusy ? '#2e3033' : '#374151',
-            color: isBusy ? '#D1D5DB' : '#ffffff'
-          }
-        }, !isBusy && 'ヒマ');
-      }));
-      timeline.push(row);
-    }
-    return /*#__PURE__*/React.createElement("div", {
-      className: "w-full overflow-x-auto custom-scrollbar flex justify-center min-w-fit"
-    }, /*#__PURE__*/React.createElement("table", {
-      className: "border-collapse inline-table",
-      style: {
-        border: '1px solid #374151'
-      }
-    }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", {
-      className: "p-1 text-xs whitespace-nowrap bg-gray-700 text-gray-200",
-      style: {
-        border: '1px solid #374151'
-      }
-    }, "\u6642\u9593"), dateRange.map(date => {
-      const dayOfWeek = date.getDay();
-      const color = dayOfWeek === 6 ? '#6d9eeb' : dayOfWeek === 0 ? '#e06666' : '#D1D5DB';
-      const formattedDate = `${date.getMonth() + 1}/${date.getDate()}(${['日', '月', '火', '水', '木', '金', '土'][dayOfWeek]})`;
-      return /*#__PURE__*/React.createElement("th", {
-        key: date.toISOString(),
-        className: "p-1 text-xs whitespace-nowrap timeline-date",
-        style: {
-          border: '1px solid #374151',
-          color
-        }
-      }, formattedDate);
-    }))), /*#__PURE__*/React.createElement("tbody", null, timeline)));
-  };
-  return /*#__PURE__*/React.createElement("div", {
-    className: "container mx-auto p-4 overflow-x-hidden relative notion-dark",
-    style: {
-      maxWidth: '680px'
-    }
-  }, /*#__PURE__*/React.createElement("h1", {
-    className: "text-2xl font-bold mb-2 text-center text-D1D5DB"
-  }, "\u30D2\u30DE\u30EA\u30B9\u30C8"), /*#__PURE__*/React.createElement("p", {
-    className: "text-sm text-gray-400 text-center mb-4"
-  }, "\u5FD9\u3057\u3044\u6BCE\u65E5\u306B\u3001\u3074\u3063\u305F\u308A\u306E\u30D2\u30DE\u6642\u9593\u3092\u898B\u3064\u3051\u308B"), /*#__PURE__*/React.createElement("button", {
-    className: "fixed top-4 right-4 bg-[#2e3033] px-5 py-3 rounded text-lg z-50",
-    onClick: () => setIsMenuOpen(!isMenuOpen)
-  }, "\u2630"), /*#__PURE__*/React.createElement("div", {
-    className: `fixed top-0 right-0 h-full w-64 bg-gray-800 shadow-lg transform transition-transform duration-300 z-50 ${isMenuOpen ? 'translate-x-0' : 'translate-x-full'}`
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "p-4"
-  }, /*#__PURE__*/React.createElement("button", {
-    className: "absolute top-4 right-4 text-gray-300 hover:text-D1D5DB",
-    onClick: () => setIsMenuOpen(false)
-  }, "\u2715"), /*#__PURE__*/React.createElement("div", {
-    className: "mt-12 space-y-4"
-  }, isSignedIn && /*#__PURE__*/React.createElement("button", {
-    className: "w-full bg-transparent text-gray-200 px-3 py-2 rounded text-sm hover:bg-gray-700 transition-all duration-200",
-    onClick: handleSignOut
-  }, "\u30ED\u30B0\u30A2\u30A6\u30C8"), /*#__PURE__*/React.createElement("button", {
-    className: "w-full custom-button px-3 py-2 rounded text-sm",
-    onClick: () => {
-      setIsMenuOpen(false);
-      setIsUsageOpen(true);
-    }
-  }, "\u4F7F\u3044\u65B9")))), error && /*#__PURE__*/React.createElement("div", {
-    className: "bg-red-800 text-red-200 px-4 py-3 rounded-lg mb-4 shadow-lg"
-  }, error), !isSignedIn ? /*#__PURE__*/React.createElement("button", {
-    className: "custom-button px-4 py-2 rounded-lg mx-auto block shadow-lg",
-    onClick: handleSignIn
-  }, "Google\u3067\u30ED\u30B0\u30A4\u30F3") : /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
-    className: "p-8 rounded-lg shadow-lg element-bg mb-4"
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "grid grid-cols-2 gap-4"
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "flex flex-col"
-  }, /*#__PURE__*/React.createElement("label", {
-    className: "block mb-1 text-D1D5DB"
-  }, "\u958B\u59CB\u65E5"), /*#__PURE__*/React.createElement("input", {
-    type: "date",
-    value: startDate,
-    onChange: e => setStartDate(e.target.value),
-    className: "border p-2 w-full sm:max-w-xs rounded hover:border-4B5EAA bg-gray-700 text-D1D5DB transition-all duration-200"
-  })), /*#__PURE__*/React.createElement("div", {
-    className: "flex flex-col"
-  }, /*#__PURE__*/React.createElement("label", {
-    className: "block mb-1 text-D1D5DB"
-  }, "\u7D42\u4E86\u65E5"), /*#__PURE__*/React.createElement("input", {
-    type: "date",
-    value: endDate,
-    onChange: e => setEndDate(e.target.value),
-    max: maxEndDate,
-    className: "border p-2 w-full sm:max-w-xs rounded hover:border-4B5EAA bg-gray-700 text-D1D5DB transition-all duration-200"
-  })), /*#__PURE__*/React.createElement("div", {
-    className: "flex flex-col"
-  }, /*#__PURE__*/React.createElement("label", {
-    className: "block mb-1 text-D1D5DB"
-  }, "\u958B\u59CB\u6642\u9593"), /*#__PURE__*/React.createElement("input", {
-    type: "time",
-    value: startTime,
-    onChange: e => setStartTime(e.target.value),
-    step: "1800",
-    className: "border p-2 w-full sm:max-w-xs rounded hover:border-4B5EAA bg-gray-700 text-D1D5DB transition-all duration-200"
-  })), /*#__PURE__*/React.createElement("div", {
-    className: "flex flex-col"
-  }, /*#__PURE__*/React.createElement("label", {
-    className: "block mb-1 text-D1D5DB"
-  }, "\u7D42\u4E86\u6642\u9593"), /*#__PURE__*/React.createElement("input", {
-    type: "time",
-    value: endTime,
-    onChange: e => setEndTime(e.target.value),
-    step: "1800",
-    className: "border p-2 w-full sm:max-w-xs rounded hover:border-4B5EAA bg-gray-700 text-D1D5DB transition-all duration-200"
-  })), /*#__PURE__*/React.createElement("div", {
-    className: "flex flex-col"
-  }, /*#__PURE__*/React.createElement("label", {
-    className: "block mb-1 text-D1D5DB tooltip"
-  }, "\u6700\u5C0F\u30D2\u30DE\u6642\u9593\uFF08\u5206\uFF09", /*#__PURE__*/React.createElement("span", {
-    className: "tooltip-text"
-  }, "\u62BD\u51FA\u3059\u308B\u7A7A\u304D\u6642\u9593\u306E\u6700\u5C0F\u5358\u4F4D\u3092\u6307\u5B9A")), /*#__PURE__*/React.createElement("select", {
-    value: minDuration,
-    onChange: e => setMinDuration(parseInt(e.target.value)),
-    className: "border p-2 w-full sm:max-w-xs rounded hover:border-4B5EAA bg-gray-700 text-D1D5DB transition-all duration-200"
-  }, /*#__PURE__*/React.createElement("option", {
-    value: "30"
-  }, "30"), /*#__PURE__*/React.createElement("option", {
-    value: "60"
-  }, "60"), /*#__PURE__*/React.createElement("option", {
-    value: "90"
-  }, "90"), /*#__PURE__*/React.createElement("option", {
-    value: "120"
-  }, "120"), /*#__PURE__*/React.createElement("option", {
-    value: "150"
-  }, "150"), /*#__PURE__*/React.createElement("option", {
-    value: "180"
-  }, "180"))), /*#__PURE__*/React.createElement("div", {
-    className: "flex flex-col"
-  }, /*#__PURE__*/React.createElement("label", {
-    className: "block mb-1 text-D1D5DB"
-  }, "\u51FA\u529B\u5F62\u5F0F"), /*#__PURE__*/React.createElement("select", {
-    value: outputFormat,
-    onChange: e => setOutputFormat(e.target.value),
-    className: "border p-2 w-full sm:max-w-xs rounded hover:border-4B5EAA bg-gray-700 text-D1D5DB transition-all duration-200"
-  }, /*#__PURE__*/React.createElement("option", {
-    value: "range"
-  }, "\u6642\u9593\u7BC4\u56F2"), /*#__PURE__*/React.createElement("option", {
-    value: "slots"
-  }, "30\u5206\u523B\u307F"))), /*#__PURE__*/React.createElement("div", {
-    className: "col-span-2"
-  }, /*#__PURE__*/React.createElement("label", {
-    className: "block mb-1 text-D1D5DB"
-  }, "\u66DC\u65E5\u9078\u629E"), /*#__PURE__*/React.createElement("div", {
-    className: "flex justify-center gap-4"
-  }, ['日', '月', '火', '水', '木', '金', '土'].map((day, index) => /*#__PURE__*/React.createElement("div", {
-    key: index,
-    className: "flex-none"
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "checkbox",
-    id: `day-${index}`,
-    className: "day-checkbox",
-    checked: includedDays.includes(index),
-    onChange: () => handleDayToggle(index)
-  }), /*#__PURE__*/React.createElement("label", {
-    htmlFor: `day-${index}`,
-    className: "day-label"
-  }, day))))), /*#__PURE__*/React.createElement("div", {
-    className: "col-span-2"
-  }, /*#__PURE__*/React.createElement("label", {
-    className: `block mb-1 ${selectedCalendars.length === 0 ? 'font-bold text-red-400' : 'text-D1D5DB'}`
-  }, "\u30AB\u30EC\u30F3\u30C0\u30FC\u9078\u629E"), /*#__PURE__*/React.createElement("select", {
-    multiple: true,
-    value: selectedCalendars,
-    onChange: e => setSelectedCalendars(Array.from(e.target.selectedOptions, option => option.value)),
-    className: "border p-2 w-full rounded hover:border-4B5EAA bg-gray-700 text-D1D5DB transition-all duration-200 custom-scrollbar"
-  }, calendars.map(calendar => /*#__PURE__*/React.createElement("option", {
-    key: calendar.id,
-    value: calendar.id
-  }, calendar.summary)))))), /*#__PURE__*/React.createElement("button", {
-    className: "custom-button px-4 py-2 rounded-lg mb-4 mx-auto block shadow-lg",
-    onClick: fetchFreeTimes,
-    disabled: loading
-  }, loading ? '読み込み中...' : 'ヒマ時間を抽出'), freeTimes.length > 0 && /*#__PURE__*/React.createElement("div", {
-    key: freeTimes.length,
-    className: "animate-fadeIn mobile-no-scroll"
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "p-8 rounded-lg shadow-lg element-bg mb-4"
-  }, /*#__PURE__*/React.createElement("h2", {
-    ref: freeTimesRef,
-    className: "text-xl font-bold mb-2 text-D1D5DB"
-  }, "\u4EE5\u4E0B\u306E\u65E5\u7A0B\u3067\u3054\u90FD\u5408\u3044\u304B\u304C\u3067\u3057\u3087\u3046\u304B"), /*#__PURE__*/React.createElement("div", {
-    className: "w-full overflow-x-auto custom-scrollbar flex justify-center min-w-fit"
-  }, /*#__PURE__*/React.createElement("pre", {
-    className: "bg-gray-700 p-4 rounded text-sm text-D1D5DB min-w-max inline-block text-left"
-  }, formatFreeTimes())), /*#__PURE__*/React.createElement("div", {
-    className: "mt-2 text-center"
-  }, /*#__PURE__*/React.createElement("button", {
-    className: "custom-button px-4 py-2 rounded-lg shadow-lg",
-    onClick: copyToClipboard
-  }, "\u30AF\u30EA\u30C3\u30D7\u30DC\u30FC\u30C9\u306B\u30B3\u30D4\u30FC"))), /*#__PURE__*/React.createElement("div", {
-    className: "p-8 rounded-lg shadow-lg element-bg mb-4"
-  }, /*#__PURE__*/React.createElement("h2", {
-    className: "text-xl font-bold mb-2 text-D1D5DB"
-  }, "\u30B9\u30B1\u30B8\u30E5\u30FC\u30EB"), renderTimeline()))), isMenuOpen && /*#__PURE__*/React.createElement("div", {
-    className: "fixed inset-0 bg-black bg-opacity-50 z-40",
-    onClick: () => setIsMenuOpen(false)
-  }), isUsageOpen && !isGuideLoading && usageGuide && /*#__PURE__*/React.createElement("div", {
-    className: "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50"
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "relative bg-gray-800 p-6 rounded-lg shadow-lg max-w-md w-full",
-    style: {
-      maxHeight: '80vh'
-    }
-  }, /*#__PURE__*/React.createElement("button", {
-    className: "absolute top-4 right-4 bg-black bg-opacity-50 rounded-full text-D1D5DB text-xl font-bold w-8 h-8 flex items-center justify-center p-0 z-60",
-    style: {
-      borderRadius: '9999px'
-    },
-    onClick: () => setIsUsageOpen(false)
-  }, "\xD7"), /*#__PURE__*/React.createElement("div", {
-    className: "overflow-y-auto custom-scrollbar",
-    style: {
-      maxHeight: 'calc(80vh - 3rem)'
-    }
-  }, /*#__PURE__*/React.createElement("h2", {
-    className: "text-2xl font-bold mb-4 text-D1D5DB"
-  }, usageGuide.title || '使い方ガイド'), /*#__PURE__*/React.createElement("p", {
-    className: "mb-4 text-D1D5DB"
-  }, usageGuide.description || 'ガイドが読み込まれていません。'), usageGuide.steps && usageGuide.steps.map(step => /*#__PURE__*/React.createElement("div", {
-    key: step.number,
-    className: "mb-4"
-  }, /*#__PURE__*/React.createElement("h3", {
-    className: "text-xl font-semibold text-D1D5DB"
-  }, step.title), /*#__PURE__*/React.createElement("ul", {
-    className: "list-disc pl-5"
-  }, step.instructions && step.instructions.map((instruction, index) => /*#__PURE__*/React.createElement("li", {
-    key: index,
-    className: "mt-2 text-D1D5DB",
-    dangerouslySetInnerHTML: {
-      __html: marked.parse(instruction)
-    }
-  }))))), /*#__PURE__*/React.createElement("div", {
-    className: "mt-4"
-  }, /*#__PURE__*/React.createElement("h3", {
-    className: "text-xl font-semibold text-D1D5DB"
-  }, usageGuide.tips?.title || '便利なポイント'), /*#__PURE__*/React.createElement("ul", {
-    className: "list-disc pl-5"
-  }, usageGuide.tips?.items && usageGuide.tips.items.map((item, index) => /*#__PURE__*/React.createElement("li", {
-    key: index,
-    className: "mt-2 text-D1D5DB",
-    dangerouslySetInnerHTML: {
-      __html: marked.parse(item)
-    }
-  })))), /*#__PURE__*/React.createElement("div", {
-    className: "mt-4"
-  }, /*#__PURE__*/React.createElement("h3", {
-    className: "text-xl font-semibold text-D1D5DB"
-  }, usageGuide.cautions?.title || '注意点'), /*#__PURE__*/React.createElement("ul", {
-    className: "list-disc pl-5"
-  }, usageGuide.cautions?.items && usageGuide.cautions.items.map((item, index) => /*#__PURE__*/React.createElement("li", {
-    key: index,
-    className: "mt-2 text-D1D5DB",
-    dangerouslySetInnerHTML: {
-      __html: marked.parse(item)
-    }
-  })))), /*#__PURE__*/React.createElement("div", {
-    className: "mt-4"
-  }, /*#__PURE__*/React.createElement("h3", {
-    className: "text-xl font-semibold text-D1D5DB"
-  }, usageGuide.support?.title || 'サポート'), /*#__PURE__*/React.createElement("p", {
-    className: "text-D1D5DB",
-    dangerouslySetInnerHTML: {
-      __html: marked.parse(usageGuide.support?.content || 'サポート情報が利用できません。')
-    }
-  }))))));
+
+  // ---------- 描画 ----------
+  const menu = h(React.Fragment, null,
+    h('button', { className: 'icon-btn menu-btn', 'aria-label': 'メニュー', onClick: () => setIsMenuOpen(true) }, h(Icon, { d: ICONS.menu })),
+    isMenuOpen && h('div', { className: 'backdrop', onClick: () => setIsMenuOpen(false) }),
+    h('nav', { className: 'drawer' + (isMenuOpen ? ' open' : ''), 'aria-hidden': !isMenuOpen },
+      h('button', { className: 'icon-btn drawer-close', 'aria-label': '閉じる', onClick: () => setIsMenuOpen(false) }, h(Icon, { d: ICONS.close })),
+      h('button', { className: 'btn primary block', onClick: () => { setIsMenuOpen(false); setIsUsageOpen(true); } }, '使い方'),
+      isSignedIn && h('button', { className: 'btn ghost block', onClick: handleSignOut }, IS_DEMO ? 'デモを終了' : 'ログアウト')));
+
+  const settings = h('section', { className: 'card' },
+    h('div', { className: 'presets' },
+      h('span', { className: 'field-label' }, '期間'),
+      [['thisWeek', '今週'], ['nextWeek', '来週'], ['13', '2週間'], ['29', '1か月']].map(([k, l]) =>
+        h('button', { key: k, className: 'chip', onClick: () => setPreset(k) }, l))),
+    h('div', { className: 'grid' },
+      h(Field, { label: '開始日' }, h('input', { type: 'date', value: startDate, min: today, onChange: e => setStartDate(e.target.value) })),
+      h(Field, { label: '終了日' }, h('input', { type: 'date', value: endDate, min: startDate, max: C.addDays(startDate, MAX_DAYS), onChange: e => setEndDate(e.target.value) })),
+      h(Field, { label: '開始時間' }, h('input', { type: 'time', value: startTime, step: 900, onChange: e => setStartTime(e.target.value) })),
+      h(Field, { label: '終了時間' }, h('input', { type: 'time', value: endTime, step: 900, onChange: e => setEndTime(e.target.value) })),
+      h(Field, { label: '最小ヒマ時間', hint: 'これより短い空きは出さない' },
+        h('select', { value: minDuration, onChange: e => setMinDuration(Number(e.target.value)) },
+          [30, 45, 60, 90, 120, 150, 180].map(v => h('option', { key: v, value: v }, `${v}分`)))),
+      h(Field, { label: '予定の前後の余裕', hint: '移動や準備の時間' },
+        h('select', { value: bufferMin, onChange: e => setBufferMin(Number(e.target.value)) },
+          [0, 10, 15, 30, 60].map(v => h('option', { key: v, value: v }, v ? `${v}分` : 'なし')))),
+      h(Field, { label: '曜日', wide: true },
+        h('div', { className: 'days' }, C.WEEKDAYS.map((day, i) => h('button', {
+          key: i, type: 'button', 'aria-pressed': includedDays.includes(i),
+          className: 'day' + (includedDays.includes(i) ? ' on' : '') + (i === 0 ? ' sun' : i === 6 ? ' sat' : ''),
+          onClick: () => handleDayToggle(i),
+        }, day)))),
+      h(Field, { label: 'カレンダー', hint: '予定を確認するカレンダー', wide: true },
+        calendars.length === 0
+          ? h('p', { className: 'muted' }, '読み込み中...')
+          : h('div', { className: 'cal-list' }, calendars.map(c => h('label', { key: c.id, className: 'cal-item' },
+            h('input', { type: 'checkbox', checked: selectedCalendars.includes(c.id), onChange: () => toggleCalendar(c.id) }),
+            h('span', { className: 'dot', style: { background: c.backgroundColor || '#888' } }),
+            h('span', { className: 'cal-name' }, c.summaryOverride || c.summary, c.primary && h('span', { className: 'muted' }, '（メイン）'))))))));
+
+  const result = freeTimes && h('section', { className: 'card fade-in', ref: resultRef },
+    h('h2', null, 'ヒマ時間'),
+    freeTimes.length === 0
+      ? h('p', { className: 'empty' }, '条件に合うヒマ時間が見つかりませんでした。期間を広げるか、最小ヒマ時間を短くしてみてください。')
+      : h(React.Fragment, null,
+        h('div', { className: 'grid' },
+          h(Field, { label: '出力形式' },
+            h('select', { value: outputFormat, onChange: e => setOutputFormat(e.target.value) },
+              h('option', { value: 'range' }, '時間範囲'),
+              h('option', { value: 'slots' }, '開始時刻の候補（30分刻み）'))),
+          h(Field, { label: '前置き文', hint: '空欄で省略' },
+            h('input', { type: 'text', value: header, placeholder: DEFAULT_HEADER, onChange: e => setHeader(e.target.value) }))),
+        h('pre', { className: 'output' }, outputText),
+        h('div', { className: 'actions' },
+          h('button', { className: 'btn primary', onClick: copyToClipboard }, h(Icon, { d: ICONS.copy }), 'コピー'),
+          navigator.share && h('button', { className: 'btn ghost', onClick: shareText }, h(Icon, { d: ICONS.share }), '共有'))),
+    h('h2', { className: 'mt' }, 'スケジュール'),
+    h(Timeline, { searched, busy, freeTimes }));
+
+  return h('div', { className: 'app' },
+    menu,
+    h('header', { className: 'hero' },
+      h('h1', null, 'ヒマリスト'),
+      h('p', { className: 'muted' }, '忙しい毎日に、ぴったりのヒマ時間を見つける'),
+      IS_DEMO && h('p', { className: 'badge' }, 'デモモード（架空の予定で表示しています）')),
+    error && h('div', { className: 'error', role: 'alert' },
+      h('span', null, error),
+      h('button', { className: 'icon-btn', 'aria-label': 'エラーを閉じる', onClick: () => setError(null) }, h(Icon, { d: ICONS.close, size: 16 }))),
+    !isSignedIn
+      ? h('div', { className: 'signin' },
+        h('button', { className: 'btn primary', onClick: handleSignIn }, 'Googleでログイン'),
+        h('p', { className: 'muted small' }, 'カレンダーは読み取りのみ。予定の内容は表示・送信しません。'),
+        h('a', { className: 'link small', href: '?demo' }, 'ログインせずにデモで試す'))
+      : h(React.Fragment, null,
+        settings,
+        h('button', { className: 'btn primary cta', onClick: fetchFreeTimes, disabled: loading },
+          loading ? '読み込み中...' : 'ヒマ時間を抽出'),
+        result),
+    isUsageOpen && h(UsageModal, { guide: usageGuide, onClose: () => setIsUsageOpen(false) }),
+    h(Toast, { message: toast }));
 }
 
-// ページ全体の横スクロールを防ぐ
-document.body.style.overflowX = 'hidden';
-ReactDOM.render(/*#__PURE__*/React.createElement(App, null), document.getElementById('root'));
+// 30分刻みのタイムライン。空き＝送るリストに入っている時間、短い空き＝最小時間に届かない空き
+function Timeline({ searched, busy, freeTimes }) {
+  if (!searched) return null;
+  const days = C.listDays(searched.startDate, searched.endDate, searched.includedDays);
+  const rows = [];
+  for (let t = searched.startTime; t < searched.endTime;) {
+    rows.push(t);
+    const d = C.parseLocal('2000-01-01', t);
+    d.setMinutes(d.getMinutes() + 30 - (d.getMinutes() % 30));
+    t = C.fmtTime(d);
+    if (t === '00:00') break;
+  }
+  const now = searched.now;
+  return h('div', { className: 'timeline-wrap' },
+    h('table', { className: 'timeline' },
+      h('thead', null, h('tr', null, h('th', null, ''), days.map(d => {
+        const dow = C.parseLocal(d).getDay();
+        return h('th', { key: d, className: dow === 0 ? 'sun' : dow === 6 ? 'sat' : '' }, C.fmtDate(C.parseLocal(d)));
+      }))),
+      h('tbody', null, rows.map((t, ri) => {
+        const next = rows[ri + 1] || searched.endTime;
+        return h('tr', { key: t },
+          h('th', null, t.endsWith(':00') ? t : ''),
+          days.map(d => {
+            const s = C.parseLocal(d, t), e = C.parseLocal(d, next);
+            let cls = 'short';
+            if (e <= now) cls = 'past';
+            else if (C.overlapsBusy(s, e, busy)) cls = 'busy';
+            else if (C.isCoveredByFree(s, e, freeTimes)) cls = 'free';
+            return h('td', { key: d, className: cls, title: `${C.fmtDate(s)} ${t}〜${next}` });
+          }));
+      }))),
+    h('div', { className: 'legend' },
+      [['free', 'ヒマ（リストに掲載）'], ['short', '短い空き・余裕時間'], ['busy', '予定あり'], ['past', '過去']].map(([c, l]) =>
+        h('span', { key: c }, h('i', { className: c }), l))));
+}
+
+function UsageModal({ guide, onClose }) {
+  const md = s => ({ __html: window.marked ? marked.parseInline(s) : s });
+  const list = items => items?.length ? h('ul', null, items.map((s, i) => h('li', { key: i, dangerouslySetInnerHTML: md(s) }))) : null;
+  return h('div', { className: 'modal-backdrop', onClick: onClose },
+    h('div', { className: 'modal', role: 'dialog', 'aria-modal': true, onClick: e => e.stopPropagation() },
+      h('button', { className: 'icon-btn modal-close', 'aria-label': '閉じる', onClick: onClose }, h(Icon, { d: ICONS.close })),
+      !guide ? h('p', { className: 'muted' }, '読み込み中...') : h('div', { className: 'modal-body' },
+        h('h2', null, guide.title),
+        h('p', null, guide.description),
+        guide.steps?.map(step => h('section', { key: step.number },
+          h('h3', null, `${step.number}. ${step.title}`), list(step.instructions))),
+        guide.tips && h('section', null, h('h3', null, guide.tips.title), list(guide.tips.items)),
+        guide.cautions && h('section', null, h('h3', null, guide.cautions.title), list(guide.cautions.items)))));
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(h(App));
